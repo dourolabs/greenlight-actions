@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only. Nothing in this repository's own CI writes anything.
+permissions:
+  contents: read
+
+jobs:
+  review-workflow:
+    name: review workflow lint / checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: actionlint
+        run: |
+          set -euo pipefail
+          version=1.7.7
+          curl -sSL --retry 3 \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz" \
+            | tar xz -C /usr/local/bin actionlint
+          actionlint \
+            .github/workflows/greenlight-review-impl.yml \
+            examples/greenlight-review.yml
+
+      # The permission split, the caller pass-through, the credential
+      # guard and the verdict normalisation — the last two extracted
+      # from the shipped YAML and executed, so this tests the code that
+      # runs rather than a copy of it.
+      - name: permission split, pass-through, credentials, verdict
+        run: scripts/check-review-workflow.sh
