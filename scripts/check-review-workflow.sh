@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify the greenlight AI review workflows without a live dispatch.
 #
-# Four things nothing else catches:
+# Five things nothing else catches:
 #
 #  1. The permission split. The `review` job must not be able to post a
 #     check run; the `report` job must. And the caller job has to grant
@@ -19,6 +19,11 @@
 #     before the checkouts.
 #  4. The verdict normalisation. Anything that is not an exact `approve`
 #     must resolve to `reject`.
+#  5. The two conclusions the `report` job posts. A reject posts
+#     `neutral` so it stays out of the PR's status roll-up; `failure`
+#     is the obvious-looking value that reddens it, and the regression
+#     is invisible everywhere else because greenlight blocks the merge
+#     either way.
 #
 # (3) and (4) both work the same way: the shell block is lifted out of
 # the shipped YAML by its `greenlight-*:begin`/`:end` markers and run
@@ -211,6 +216,48 @@ if grep -q 'claude-opus-5' "$IMPL"; then
   ok "impl pins the model to claude-opus-5"
 else
   fail "impl must default the model to claude-opus-5"
+fi
+
+## 2a. The two conclusions the report job posts.
+
+# A reject posts `neutral`, not `failure`. GitHub has no way to keep a
+# check run out of a commit's status roll-up, and `conclusion` is the
+# only lever: GitHub counts `success`, `skipped` and `neutral` as
+# successful check statuses, so `neutral` leaves the roll-up green and
+# `failure` turns it red. Greenlight's reviewer gate reads `neutral` as
+# Reject and still blocks the merge.
+#
+# `failure` reads like the obvious value for a reject, so this is the
+# assertion most likely to be "fixed" back. It is pinned in both
+# directions on purpose, and the negative is the load-bearing half: the
+# regression is silent everywhere else, because a `failure` reject still
+# blocks the merge in greenlight and only shows up as a red X this
+# change existed to remove.
+if printf '%s\n' "$report_block" | grep -q '^            conclusion=neutral$'; then
+  ok "report job posts conclusion=neutral on a reject"
+else
+  fail "report job must post 'conclusion=neutral' on a reject: 'failure' reddens the PR's status roll-up and 'neutral' does not. See README.md, 'Why a reject posts neutral'"
+fi
+
+if printf '%s\n' "$report_block" | grep -q '^            conclusion=failure$'; then
+  fail "report job posts 'conclusion=failure'; that reddens the PR's status roll-up, which is what the neutral reject exists to avoid. See README.md, 'Why a reject posts neutral'"
+else
+  ok "report job never posts conclusion=failure"
+fi
+
+if printf '%s\n' "$report_block" | grep -q '^            conclusion=success$'; then
+  ok "report job posts conclusion=success on an approve"
+else
+  fail "report job must post 'conclusion=success' on an approve"
+fi
+
+# The conclusion went neutral; the title is what still tells the human
+# the review rejected, because it is what GitHub renders beside the
+# check name in the merge box.
+if printf '%s\n' "$report_block" | grep -q '^            title="Rejected"$'; then
+  ok "report job still titles a reject \"Rejected\""
+else
+  fail "report job must keep 'title=\"Rejected\"' on a reject: with the conclusion now neutral, the title is the only thing that shows the human the review rejected"
 fi
 
 ## 2b. The agent step's token and actor gates.

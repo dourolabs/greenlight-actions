@@ -8,9 +8,11 @@ name: greenlight AI review (implementation)
 # upgrades by moving the ref it calls, not by editing its own YAML.
 #
 # The contract with greenlight is one sentence: post a check run named
-# `check_name` against `head_sha`, `success` to approve and `failure`
-# to reject. Greenlight keys on nothing else. See
-# README.md in this repository.
+# `check_name` against `head_sha`, `success` to approve and `neutral`
+# to reject. Greenlight keys on nothing else. `neutral` rather than
+# `failure` because GitHub counts `neutral` as a successful check
+# status, so a reject leaves the PR's status roll-up green instead of
+# reddening it. See README.md in this repository.
 
 on:
   workflow_call:
@@ -342,11 +344,25 @@ jobs:
           # Second, independent exact match. `needs.review.outputs.verdict`
           # is empty when the review job did not reach its last step, and
           # empty is a reject like everything else that is not `approve`.
+          #
+          # A reject posts `neutral`, not `failure`. GitHub has no way to
+          # keep a check run out of a commit's status roll-up, and
+          # `conclusion` is the only lever: GitHub counts `success`,
+          # `skipped` and `neutral` as successful check statuses, so a
+          # `neutral` reject leaves the roll-up green while `failure`
+          # turns it red. The `title` still reads "Rejected", which is
+          # what GitHub renders beside the check name, so the human in
+          # the merge box still sees the verdict and the reason.
+          #
+          # Greenlight's own reviewer gate reads this conclusion and
+          # still blocks the merge. Do not "fix" this back to `failure`;
+          # scripts/check-review-workflow.sh fails if you do. See
+          # README.md, "Why a reject posts `neutral`".
           if [ "${VERDICT:-}" = "approve" ]; then
             conclusion=success
             title="Approved"
           else
-            conclusion=failure
+            conclusion=neutral
             title="Rejected"
           fi
 
