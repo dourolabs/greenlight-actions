@@ -107,7 +107,9 @@ verdict.
    `greenlight-review-impl.yml` and adds `secrets: inherit`.
 3. The `review` job checks out the base ref and the head sha into
    separate directories, composes the prompt from the **base** checkout,
-   runs the agent, and emits a verdict as a job output.
+   runs the agent, and emits a verdict as a job output. It resolves every
+   failure it knows about into a reject rather than failing — see
+   [Why the review job stays green](#why-the-review-job-stays-green).
 4. The `report` job reads that output and posts the check run.
 
 `workflow_dispatch` cannot trigger a `workflow_call`-only reusable
@@ -203,20 +205,25 @@ onboard.
 **Exactly one, and the run says so when it is not.** `workflow_call`
 cannot express "one of these two", so neither secret is declared
 `required: true`. A guard step at the top of the `review` job enforces it
-instead, before either checkout, and fails the run loudly rather than
-producing a silent non-verdict:
+instead, before either checkout, and says so loudly rather than producing
+a silent non-verdict:
 
-- **Neither set** — the run fails, naming both secrets.
-- **Both set** — the run *also* fails. The workflow deliberately does not
-  pick between them: the action accepts both, and a silent precedence
-  this workflow does not control is what turns a credential change into a
-  long debug. Remove one secret, or narrow its org-level
+- **Neither set** — the review rejects, naming both secrets.
+- **Both set** — the review *also* rejects. The workflow deliberately
+  does not pick between them: the action accepts both, and a silent
+  precedence this workflow does not control is what turns a credential
+  change into a long debug. Remove one secret, or narrow its org-level
   repository-access policy so it does not reach the repository.
+
+Both land as a `greenlight/review-<name>` check run reading "Rejected",
+whose summary is the sentence above, plus an `::error::` annotation on
+the run. The job itself stays green — see
+[Why the review job stays green](#why-the-review-job-stays-green).
 
 That second rule is worth knowing before you switch credential types.
 Adding the new secret org-wide while the old one is still visible breaks
 every review until you remove the old one, so **remove first and add
-second**. The failure is fail-safe — the PR stays blocked and is
+second**. The outcome is fail-safe — the PR stays blocked and is
 re-dispatchable — but it is not self-healing.
 
 ### Write a prompt and reference it
@@ -326,7 +333,16 @@ whole design exists to prevent.
 The agent's summary is stripped of newlines before it is written to
 `$GITHUB_OUTPUT`. That is not tidying: `$GITHUB_OUTPUT` is
 line-oriented, so a summary carrying a newline could append its own
-`verdict=approve` line and overwrite the real verdict.
+`verdict=approve` line and overwrite the real verdict. The same applies
+to the `REVIEW_FATAL` diagnostics described in the next section, which
+ride on `$GITHUB_ENV`.
+
+**A `review` job that hits a known failure rejects rather than failing.**
+A missing credential, a checkout that did not land, a prompt that raced
+off the base ref, an agent that crashes or runs past its cap: each used
+to fail the job, which posted nothing and left the PR waiting out
+greenlight's dispatch timeout. Each now becomes an immediate reject whose
+summary names the cause. Why the job must not fail is the next section.
 
 **The credential is the one secret inside the blast radius.** It reaches
 the `review` job, which is the job that reads untrusted input. An
@@ -335,6 +351,88 @@ rotate it as you would any CI credential. A `CLAUDE_CODE_OAUTH_TOKEN`
 used in its place inherits exactly that exposure and is worse in kind: it
 is an account-scoped credential rather than a scoped, independently
 rotatable API key, so it widens what a successful injection would reach.
+
+## Why the review job stays green
+
+Greenlight dispatches the caller with `workflow_dispatch` **on the PR's
+base branch** — that split is what stops a PR editing its own reviewer,
+and it is not negotiable. GitHub Actions attaches a workflow run's check
+suite to the **dispatched ref's tip commit**. So every review run writes
+its two job check runs, `review / review` and `review / report`, onto the
+base branch's head commit in *your* repository. For an ordinary PR that
+commit is the tip of your `main`.
+
+Nothing keeps them off it. The two check runs name jobs, not verdicts,
+and the verdict check run the `report` job posts against `head_sha` is a
+separate thing entirely. So a `review` job that exits non-zero puts a red
+X on your `main`'s tip, for a failure that has nothing to do with `main`
+and that no commit on `main` can fix.
+
+**So the `review` job does not exit non-zero.** Every failure mode it
+knows about is caught where it happens, recorded in a `REVIEW_FATAL`
+environment variable, and turned into `verdict=reject` by the last step —
+with `REVIEW_FATAL` as the summary. The `report` job posts that like any
+other reject: `neutral`, titled "Rejected", carrying the reason.
+
+| Failure | What the PR sees |
+| --- | --- |
+| Neither credential secret is visible | Rejected: "The review agent has no credential…" |
+| Both credential secrets are visible | Rejected: "Both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN are visible…" |
+| The base ref did not check out | Rejected, naming the ref |
+| The head sha did not check out | Rejected, naming the sha |
+| `prompt_path` is gone from the base ref | Rejected, naming the file and the ref |
+| The agent crashes, or runs past its cap | Rejected: "The review agent did not finish…" |
+| The agent returns nothing parseable | Rejected: "no usable verdict" — unchanged |
+
+Three mechanics hold this up, and every one of them reads like something
+to tidy away:
+
+- **`exit 0`, never `exit 1`, in the guard steps.** A guard writes its
+  diagnostic to `$GITHUB_ENV` and returns success. `exit 1` after an
+  `::error::` is the obvious-looking shape and is exactly the regression
+  this section exists to prevent.
+- **`continue-on-error: true` on every step that can fail.** The two
+  checkouts, the two guards, the preflight check and the agent. It reads
+  like sloppiness; it is what keeps an unanticipated step failure off
+  your `main`'s tip.
+- **`timeout-minutes` on the *agent step*, not only on the job.** A step
+  that overruns *fails*, and a failed step is already a reject. A job
+  that overruns is *cancelled*, and nothing inside a cancelled job runs
+  to catch it. The step cap is 14 minutes and the job cap is 16, both
+  under greenlight's 20-minute dispatch timeout.
+
+`scripts/check-review-workflow.sh` pins all three structurally, and
+executes each guard block against every case.
+
+**The verdict is still fail-safe.** None of this can produce an approve.
+Only a literal `approve` approves, matched exactly, twice — once in
+`review` and again in `report` — and every failure caught here is a
+reject by construction.
+
+### What still reddens the base branch
+
+Two cases are outside any workflow's reach:
+
+- **`startup_failure`.** GitHub refuses to build the job graph — the
+  usual cause is a caller whose `permissions:` block grants less than
+  this workflow's jobs request. No job runs, so no job check run is
+  created, so there is nothing to redden; the commit's
+  `statusCheckRollup` is untouched. Harmless to the roll-up, and
+  invisible to the PR, which is its own problem — see
+  [Reading a failed run](#reading-a-failed-run).
+- **A lost runner, or a job cancelled from outside.** Nothing inside the
+  job runs, so nothing inside it can catch anything. Its check run goes
+  red on the base branch's tip and no workflow change can prevent that.
+  `report` is declared `if: ${{ !cancelled() }}` rather than taking
+  `needs: review`'s default, so it still runs and still posts a reject —
+  "The review job produced no verdict" — instead of skipping and leaving
+  the PR to wait out the dispatch timeout. The one case it deliberately
+  skips is a human cancelling the whole run, which is what `cancelled()`
+  reports; obeying that is the point of not writing `always()`.
+
+A `report` job that cannot post its check run also fails, and that one is
+deliberate: it means the contract was not fulfilled, and a green job
+hiding that would leave the PR waiting with nothing to read.
 
 ## Fork PRs are never reviewed
 
@@ -373,35 +471,55 @@ that produced it.
 | --- | --- |
 | No workflow run at all | A `403` means the greenlight App was never re-authorized for **Actions: write** — see [Authorize the greenlight App](#authorize-the-greenlight-app). A `404` means the caller workflow is missing from your default branch or from the PR's base branch, or its filename does not match what greenlight dispatches to. |
 | Run is `startup_failure` with zero jobs and no log | The caller job grants less than this workflow's jobs request. Put `permissions:` with `contents: read` and `checks: write` on the caller's `review:` job — see [Keep the `permissions:` block on the `review:` job](#keep-the-permissions-block-on-the-review-job). GitHub refuses to build the job graph before anything starts, so there is no log to open; the reason shows only in the Actions web UI. |
-| Run fails before the agent starts, complaining about a secret | The `Check the agent credentials` step names which case it is. Neither visible: check the org secret's repository-access policy, and that the caller still says `secrets: inherit`. Both visible: remove one, or narrow its access policy — the workflow will not pick between them. See [Set the agent credential](#set-the-agent-credential). |
-| Run starts, fails immediately | The `review` job log. A missing `prompt_path` on the base ref fails with an `::error::` naming the file and the ref: add the file to the base branch, or drop the review from `.github/greenlight.yml`. |
+| The review rejects, complaining about a secret | The `Check the agent credentials` step names which case it is. Neither visible: check the org secret's repository-access policy, and that the caller still says `secrets: inherit`. Both visible: remove one, or narrow its access policy — the workflow will not pick between them. See [Set the agent credential](#set-the-agent-credential). |
+| Run is green, check run says "Rejected" with a diagnostic summary | A guard caught a known failure and turned it into a reject rather than failing the job — see [Why the review job stays green](#why-the-review-job-stays-green). The summary names the cause; the `review` job log carries the matching `::error::` annotation. A missing `prompt_path` on the base ref reads this way: add the file to the base branch, or drop the review from `.github/greenlight.yml`. |
 | Check run says "Rejected" with a summary about no usable verdict | The agent ran but returned nothing parseable. The `review` job's "Normalise the verdict" step prints what it resolved; the agent transcript is in the step above it. |
-| Run is red and no check run appeared | `review` failed, so `report` was skipped and nothing was posted. That is the fail-safe path, not a bug. Open `review` for the cause. |
-| `report` fails | Usually the `checks: write` permission. Check the caller job's `permissions:` block first, then the org or repo Actions permission policy, either of which can cap what a workflow may request. |
-| The PR says the review timed out | Nothing posted a check run within greenlight's dispatch timeout. The reason links the run; open it and read `review`. Greenlight never re-dispatches the same sha on its own. |
+| Check run says "Rejected", summary says the agent did not finish | The agent crashed or ran past its 14-minute step cap. Open the "Run the review agent" step; the step is red inside a green job, which is what `continue-on-error` looks like. |
+| Check run says the review job produced no verdict | The `review` job itself went down — a lost runner, or a job cancelled from outside. That one also reddens the base branch's tip commit, and nothing in the workflow can prevent it. Re-dispatch. |
+| `report` fails, and no check run appeared | Usually the `checks: write` permission. Check the caller job's `permissions:` block first, then the org or repo Actions permission policy, either of which can cap what a workflow may request. `report` is the one job still allowed to fail: it failing means the contract was not fulfilled, and a green job hiding that is worse. |
+| The PR says the review timed out | Nothing posted a check run within greenlight's dispatch timeout. Rare now — the `review` job turns its own failures into rejects, so this points at `report`, at a cancelled run, or at a lost runner. The reason links the run; open it. Greenlight never re-dispatches the same sha on its own. |
 
 The agent's full transcript is in the `review` job's "Run the review
 agent" step.
 
 ## Timeouts
 
-The `review` job is capped at **15 minutes**, comfortably under
-greenlight's 20-minute dispatch timeout, so a stuck agent fails its own
-job rather than racing that timeout. Both outcomes block the PR; failing
-first produces the more diagnosable one. It is not a caller input,
-because a repository that needs longer than 15 minutes needs a smaller
-prompt more than it needs a bigger budget.
+The agent step is capped at **14 minutes** and the `review` job at
+**16**, both comfortably under greenlight's 20-minute dispatch timeout,
+so a stuck agent resolves to a reject rather than racing that timeout.
+
+The cap that matters is the one on the **step**. A step that overruns
+fails, `continue-on-error` keeps the job green, and the verdict step
+turns it into a reject naming the cause. A job that overruns is
+*cancelled*, and nothing inside a cancelled job runs to catch it — so the
+job cap is a backstop two minutes above the step's, not the budget. Do
+not collapse the two into one.
+
+Neither is a caller input, because a repository that needs longer than 14
+minutes needs a smaller prompt more than it needs a bigger budget.
 
 ## Changing these workflows
 
 `scripts/check-review-workflow.sh` asserts the caller pass-through and
 its permission ceiling, the two-job permission split, the agent step's
 `github_token` and `allowed_bots` keys, the two conclusions the `report`
-job posts, the credential handling, and the verdict normalisation — the
-last two by extracting the shipped shell blocks from the YAML and
-executing them, against every combination of the two secrets and against
-malformed agent output respectively. CI runs it alongside `actionlint` on
-both workflow files. Run both after any edit.
+job posts, and — structurally — that no step in the `review` job exits
+non-zero, that every fallible one carries `continue-on-error: true`, and
+that the agent's step cap sits under the job's cap and both under
+greenlight's dispatch timeout.
+
+It then extracts four shell blocks from the shipped YAML by their
+`greenlight-*:begin`/`:end` markers and executes them, so the tests run
+the code CI runs rather than a copy of it: the credential guard against
+every combination of the two secrets, the prompt step against each
+missing checkout and a missing prompt file, the preflight check against
+each step outcome, and the verdict normalisation against malformed agent
+output, a failed agent step and a guard-recorded failure. Every case
+asserts the block exits **0** — an `exit 1` there reddens the base branch
+tip in every consuming repository.
+
+CI runs it alongside `actionlint` on both workflow files. Run both after
+any edit.
 
 The conclusions are pinned in both directions: `conclusion=neutral` must
 be present on the reject branch and `conclusion=failure` must be absent
