@@ -29,7 +29,7 @@ run described below, and this README is written to stand alone.
 One sentence, and greenlight keys on nothing else:
 
 > The workflow posts a check run named `check_name` against `head_sha`,
-> with conclusion `success` to approve and `failure` to reject.
+> with conclusion `success` to approve and `neutral` to reject.
 
 Greenlight reads the check run and nothing else — not the run status,
 not comments, not `workflow_run` events:
@@ -37,13 +37,64 @@ not comments, not `workflow_run` events:
 | Check-run conclusion | Greenlight decision |
 | --- | --- |
 | `success` | Approve |
-| `failure`, `cancelled`, `timed_out` | Reject |
-| `neutral`, `action_required`, `stale`, `skipped` | Escalate to a human |
+| `failure`, `cancelled`, `timed_out`, `neutral` | Reject |
+| `action_required`, `stale`, `skipped` | Escalate to a human |
 | no check run yet | Hold at "waiting reviewer" |
 
 The workflow posts no PR comments at all. The job that runs the agent
 holds a read-only token by design (see below), so the agent has nothing
 to comment with. The verdict summary rides on the check run instead.
+
+`failure` stays a Reject even though this workflow no longer posts it.
+Third-party reviewers that a repository names as required reviewers post
+`failure` to reject, and greenlight has to keep reading them.
+
+### Why a reject posts `neutral`
+
+A reject is a verdict for a human to read, not a broken build, so it
+should not redden the PR's status roll-up. GitHub offers no way to keep
+a check run out of that roll-up —
+[community discussion #26246](https://github.com/orgs/community/discussions/26246)
+has asked for one since April 2021 — so the `conclusion` value is the
+only lever. From GitHub's
+[Troubleshooting required status checks](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks):
+
+> Successful check statuses are `success`, `skipped`, and `neutral`.
+
+Measured on three orphaned PR-head commits, each all-green beforehand,
+reading `repository.object(oid).statusCheckRollup.state` over GraphQL:
+
+| Conclusion posted | Roll-up state after |
+| --- | --- |
+| `neutral` | `SUCCESS` |
+| `skipped` | `SUCCESS` |
+| `failure` | `FAILURE` |
+
+So the `report` job posts `neutral` on a reject. It keeps `output.title`
+at `"Rejected"` and keeps the agent's summary — the title is what GitHub
+renders beside the check name, so a human in the merge box still reads
+"Rejected" and the reason.
+
+`skipped` would work on the roll-up too, but greenlight maps it to
+Escalate, and "skipped" is the wrong word for a review that ran and
+reached a verdict.
+
+### Consequence: a reject no longer blocks on GitHub's side
+
+Read the quoted sentence the other way and a `neutral` check run
+**satisfies** a GitHub required status check. If a repository lists
+`greenlight/review-<name>` under a branch-protection
+`required_status_checks` rule, a reject stops blocking the merge button
+in the GitHub UI, and a human with write access can merge past it.
+
+**Greenlight's own reviewer gate is unaffected.** It gates on the verdict
+it persisted from the check run, not on the roll-up, so greenlight still
+refuses to auto-merge a rejected PR and its PR status comment still says
+rejected.
+
+Do not put a greenlight review check in `required_status_checks`. Require
+it as a reviewer check instead — that path gates on the persisted
+verdict.
 
 ## How a review runs
 
@@ -345,8 +396,16 @@ prompt more than it needs a bigger budget.
 
 `scripts/check-review-workflow.sh` asserts the caller pass-through and
 its permission ceiling, the two-job permission split, the agent step's
-`github_token` and `allowed_bots` keys, the credential handling, and the
-verdict normalisation — the last two by extracting the shipped shell
-blocks from the YAML and executing them, against every combination of the
-two secrets and against malformed agent output respectively. CI runs it
-alongside `actionlint` on both workflow files. Run both after any edit.
+`github_token` and `allowed_bots` keys, the two conclusions the `report`
+job posts, the credential handling, and the verdict normalisation — the
+last two by extracting the shipped shell blocks from the YAML and
+executing them, against every combination of the two secrets and against
+malformed agent output respectively. CI runs it alongside `actionlint` on
+both workflow files. Run both after any edit.
+
+The conclusions are pinned in both directions: `conclusion=neutral` must
+be present on the reject branch and `conclusion=failure` must be absent
+anywhere in the `report` job. The negative is the load-bearing half —
+`failure` reads like the obvious value for a reject, and nothing else
+catches the regression, because greenlight blocks the merge either way
+and the only symptom is the red roll-up this design exists to avoid.

@@ -27,9 +27,10 @@ jobs:
             .github/workflows/greenlight-review-impl.yml \
             examples/greenlight-review.yml
 
-      # The permission split, the caller pass-through, the credential
-      # guard and the verdict normalisation — the last two extracted
-      # from the shipped YAML and executed, so this tests the code that
-      # runs rather than a copy of it.
-      - name: permission split, pass-through, credentials, verdict
+      # The permission split, the caller pass-through, the two
+      # conclusions the report job posts, the credential guard and the
+      # verdict normalisation — the last two extracted from the shipped
+      # YAML and executed, so this tests the code that runs rather than
+      # a copy of it.
+      - name: permission split, pass-through, conclusions, credentials, verdict
         run: scripts/check-review-workflow.sh
