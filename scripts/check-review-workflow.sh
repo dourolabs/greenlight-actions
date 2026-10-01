@@ -163,10 +163,26 @@ else
 $(diff <(printf '%s\n' "${INPUTS[@]}") <(echo "$caller_inputs") || true)"
 fi
 
-if grep -q '^    secrets: inherit$' "$CALLER"; then
-  ok "caller inherits secrets"
+# `secrets: inherit` passes nothing to a reusable workflow in another
+# org, so the caller must name each secret.
+if grep -q 'secrets: inherit' "$CALLER"; then
+  fail "caller must not use 'secrets: inherit': it does not reach a reusable workflow in another org"
 else
-  fail "caller must pass 'secrets: inherit' so the org-level credential reaches the reusable workflow"
+  ok "caller does not use 'secrets: inherit'"
+fi
+
+for name in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; do
+  if grep -qxF "      ${name}: \${{ secrets.${name} }}" "$CALLER"; then
+    ok "caller passes ${name} by name"
+  else
+    fail "caller must pass '${name}: \${{ secrets.${name} }}' under 'secrets:'"
+  fi
+done
+
+if grep -qx '    secrets:' "$CALLER"; then
+  ok "caller declares a secrets: block"
+else
+  fail "caller must declare a 'secrets:' block on the review job"
 fi
 
 ## 1b. The caller job's permission ceiling.

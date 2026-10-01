@@ -59,7 +59,7 @@ on:
       # diagnostic `required: true` used to buy, without the red X on the base
       # branch that a failed job would leave.
       ANTHROPIC_API_KEY:
-        description: "Anthropic API key. Set it once as an org-level Actions secret; the caller passes `secrets: inherit`."
+        description: "Anthropic API key. Set it once as an org-level Actions secret; the caller passes it by name under `secrets:`."
         required: false
       CLAUDE_CODE_OAUTH_TOKEN:
         description: "Claude Code OAuth token, an alternative to ANTHROPIC_API_KEY. Set exactly one of the two."
@@ -140,8 +140,10 @@ jobs:
           if [ "$key" = no ] && [ "$token" = no ]; then
             fatal="The review agent has no credential. Set exactly one of the Actions secrets
               ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, and make sure the caller workflow passes
-              'secrets: inherit'. An org-level secret also needs a repository-access policy covering
-              this repository. See README.md#set-the-agent-credential in dourolabs/greenlight-actions."
+              both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN by name under 'secrets:'.
+              'secrets: inherit' does not reach a workflow in another org. An org-level secret also
+              needs a repository-access policy covering this repository.
+              See README.md#set-the-agent-credential in dourolabs/greenlight-actions."
           elif [ "$key" = yes ] && [ "$token" = yes ]; then
             fatal="Both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN are visible to this run.
               Set exactly one: this workflow does not pick between them, because a silent precedence
