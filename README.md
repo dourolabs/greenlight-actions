@@ -104,7 +104,8 @@ verdict.
    `head_sha`, `pr_number`, `base_ref`, `review_name`, `prompt_path` and
    `check_name`.
 2. That thin caller passes all six to this repository's
-   `greenlight-review-impl.yml` and adds `secrets: inherit`.
+   `greenlight-review-impl.yml` and passes `ANTHROPIC_API_KEY` and
+   `CLAUDE_CODE_OAUTH_TOKEN` by name under `secrets:`.
 3. The `review` job checks out the base ref and the head sha into
    separate directories, composes the prompt from the **base** checkout,
    runs the agent, and emits a verdict as a job output. It resolves every
@@ -197,8 +198,12 @@ an OAuth token is account-scoped. This secret reaches the job that reads
 untrusted input, so the narrower credential is the better one — see the
 blast-radius note under [Why two jobs](#why-two-jobs).
 
-The caller passes `secrets: inherit`, which is what carries an org-level
-secret into the reusable workflow. Give whichever secret you set an
+The caller passes both secrets by name under `secrets:`, which is what
+carries an org-level secret into the reusable workflow. It does not use
+`secrets: inherit`, because `inherit` passes nothing when the caller and
+the reusable workflow are in different orgs or enterprises, and this
+workflow lives in `dourolabs`. An unset secret passes as an empty string,
+which the guard below treats as absent. Give whichever secret you set an
 org-level repository-access policy that covers the repositories you
 onboard.
 
@@ -471,7 +476,7 @@ that produced it.
 | --- | --- |
 | No workflow run at all | A `403` means the greenlight App was never re-authorized for **Actions: write** — see [Authorize the greenlight App](#authorize-the-greenlight-app). A `404` means the caller workflow is missing from your default branch or from the PR's base branch, or its filename does not match what greenlight dispatches to. |
 | Run is `startup_failure` with zero jobs and no log | The caller job grants less than this workflow's jobs request. Put `permissions:` with `contents: read` and `checks: write` on the caller's `review:` job — see [Keep the `permissions:` block on the `review:` job](#keep-the-permissions-block-on-the-review-job). GitHub refuses to build the job graph before anything starts, so there is no log to open; the reason shows only in the Actions web UI. |
-| The review rejects, complaining about a secret | The `Check the agent credentials` step names which case it is. Neither visible: check the org secret's repository-access policy, and that the caller still says `secrets: inherit`. Both visible: remove one, or narrow its access policy — the workflow will not pick between them. See [Set the agent credential](#set-the-agent-credential). |
+| The review rejects, complaining about a secret | The `Check the agent credentials` step names which case it is. Neither visible: check the org secret's repository-access policy, and that the caller still passes both secrets by name under `secrets:`. Both visible: remove one, or narrow its access policy — the workflow will not pick between them. See [Set the agent credential](#set-the-agent-credential). |
 | Run is green, check run says "Rejected" with a diagnostic summary | A guard caught a known failure and turned it into a reject rather than failing the job — see [Why the review job stays green](#why-the-review-job-stays-green). The summary names the cause; the `review` job log carries the matching `::error::` annotation. A missing `prompt_path` on the base ref reads this way: add the file to the base branch, or drop the review from `.github/greenlight.yml`. |
 | Check run says "Rejected" with a summary about no usable verdict | The agent ran but returned nothing parseable. The `review` job's "Normalise the verdict" step prints what it resolved; the agent transcript is in the step above it. |
 | Check run says "Rejected", summary says the agent did not finish | The agent crashed or ran past its 14-minute step cap. Open the "Run the review agent" step; the step is red inside a green job, which is what `continue-on-error` looks like. |
