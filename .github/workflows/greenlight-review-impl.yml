@@ -50,6 +50,11 @@ on:
         description: The check-run name to post against `head_sha`.
         required: true
         type: string
+      verdict_url:
+        description: Greenlight's verdict route. When set, `report` POSTs the verdict there with an Actions OIDC token. Empty skips the POST.
+        required: false
+        type: string
+        default: ''
     secrets:
       # Exactly one of these two authenticates the review agent. Neither is
       # `required: true`, because `workflow_call` cannot express "exactly one
@@ -480,10 +485,11 @@ jobs:
           echo "resolved verdict: ${verdict}"
       # greenlight-verdict-normalise:end
 
-  # The trusted half. It holds `checks: write` and never touches the head
-  # checkout, the diff or the model. The agent cannot reach this job, so
-  # an injected agent cannot forge its own approving check run. Do not
-  # collapse these two jobs.
+  # The trusted half. It holds `checks: write` and `id-token: write`, and
+  # never touches the head checkout, the diff or the model. The agent
+  # cannot reach this job, so an injected agent can neither forge its own
+  # approving check run nor mint the OIDC token Greenlight accepts a
+  # verdict with. Do not collapse these two jobs.
   report:
     name: report
     needs: review
@@ -498,6 +504,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       checks: write
+      id-token: write
     timeout-minutes: 5
     steps:
       - name: Post the check run
@@ -573,3 +580,90 @@ jobs:
             --input payload.json > /dev/null
 
           echo "posted check run '${CHECK_NAME}' (${REVIEW_NAME}) on ${HEAD_SHA}: ${conclusion}"
+
+      # Greenlight reads the verdict from this POST, not from the check
+      # run above, which is for display. The token proves to Greenlight
+      # which workflow run sent the verdict, so it can accept a verdict
+      # only from the run it dispatched. An empty `verdict_url` (an older
+      # Greenlight server) skips this step, and the run does what `v1`
+      # did. The verdict and summary are read back from the check run's
+      # payload, so the POST always says what the check run shows.
+      #
+      # greenlight-verdict-post:begin
+      - name: Send the verdict to Greenlight
+        if: ${{ inputs.verdict_url != '' }}
+        env:
+          VERDICT_URL: ${{ inputs.verdict_url }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${VERDICT_URL:-}" ]; then
+            echo "no verdict_url; skipping the verdict POST"
+            exit 0
+          fi
+
+          # 1. An OIDC token whose `aud` is the verdict URL. Greenlight
+          #    checks `aud` against the same string it dispatched.
+          audience=$(jq -rn --arg u "${VERDICT_URL}" '$u | @uri')
+          token=$(curl -sS --fail --retry 3 --max-time 30 \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL:-}&audience=${audience}" \
+            | jq -r '.value // empty' 2>/dev/null || true)
+          if [ -z "${token}" ]; then
+            echo "::error::could not get an Actions OIDC token. Does the caller job grant 'id-token: write'? See README.md#the-verdict-post"
+            exit 1
+          fi
+          echo "::add-mask::${token}"
+
+          # 2. The body. Greenlight caps `summary` at 1000 characters;
+          #    `jq` slices by character, so a multi-byte summary stays
+          #    valid UTF-8.
+          jq '{
+                verdict: (if .conclusion == "success" then "approve" else "reject" end),
+                summary: (.output.summary | .[0:1000])
+              }' payload.json > verdict.json
+
+          # 3. POST, retrying 5xx and network errors (`000`) 3 times.
+          delay=${VERDICT_RETRY_DELAY:-2}
+          attempt=1
+          while :; do
+            status=$(curl -sS -o response.json -w '%{http_code}' --max-time 30 \
+              -X POST \
+              -H "Authorization: Bearer ${token}" \
+              -H "Content-Type: application/json" \
+              --data-binary @verdict.json \
+              "${VERDICT_URL}" || true)
+            case "${status}" in
+              000|5??)
+                if [ "${attempt}" -le 3 ]; then
+                  echo "verdict POST attempt ${attempt} got ${status}; retrying in ${delay}s"
+                  sleep "${delay}"
+                  delay=$((delay * 2))
+                  attempt=$((attempt + 1))
+                  continue
+                fi
+                ;;
+            esac
+            break
+          done
+
+          # 4. Key on the status alone. The body is `{"error", "status"}`;
+          #    its text is printed for the reader and never parsed.
+          error=$(jq -r '.error // empty' response.json 2>/dev/null || true)
+          verdict=$(jq -r .verdict verdict.json)
+          case "${status}" in
+            204)
+              echo "Greenlight recorded the verdict (${verdict})"
+              ;;
+            409)
+              # Both 409s mean nothing more can be sent: a verdict for
+              # this run is already recorded, or the review is no longer
+              # configured.
+              echo "::warning::Greenlight did not record the verdict (409): ${error:-no error text}"
+              ;;
+            *)
+              echo "::error::Greenlight refused the verdict (${status}): ${error:-no error text}"
+              exit 1
+              ;;
+          esac
+      # greenlight-verdict-post:end

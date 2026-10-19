@@ -1,19 +1,21 @@
 # greenlight-actions
 
 The reusable GitHub Actions workflow that runs greenlight's **AI review
-gate**: it reviews a pull request with Claude Code and posts the verdict
-as a check run.
+gate**: it reviews a pull request with Claude Code, posts the verdict as
+a check run, and sends the verdict to greenlight with an Actions OIDC
+token.
 
 This repository is public so that any repository — in any organisation,
 private ones included — can call the workflow. **It is the source of
 truth for the reusable workflow.** There is no upstream copy and nothing
 mirrors files into it; a change ships here and consumers pick it up when
-the `v1` tag moves.
+the `v2` tag moves.
 
 The greenlight server that dispatches this workflow lives in
 `dourolabs/prototypes`, which is **private**. Nothing here needs it: the
-workflow's whole interface is the six dispatch inputs and the one check
-run described below, and this README is written to stand alone.
+workflow's whole interface is the seven dispatch inputs, the one check
+run and the one verdict POST described below, and this README is written
+to stand alone.
 
 ## Contents
 
@@ -26,7 +28,14 @@ run described below, and this README is written to stand alone.
 
 ## The contract
 
-One sentence, and greenlight keys on nothing else:
+The workflow hands greenlight the verdict in two ways. It posts a check
+run, as `v1` did. And when greenlight sends a `verdict_url`, it also
+POSTs the verdict there with an OIDC token — see
+[The verdict POST](#the-verdict-post). Today's greenlight reads the
+check run. Once greenlight's cutover ships, it reads only the POST, and
+the check run is for display.
+
+The check-run half is one sentence:
 
 > The workflow posts a check run named `check_name` against `head_sha`,
 > with conclusion `success` to approve and `neutral` to reject.
@@ -48,6 +57,35 @@ to comment with. The verdict summary rides on the check run instead.
 `failure` stays a Reject even though this workflow no longer posts it.
 Third-party reviewers that a repository names as required reviewers post
 `failure` to reject, and greenlight has to keep reading them.
+
+### The verdict POST
+
+A check run says nothing about who posted it: any token with
+`checks: write` in the repository can post one with the right name. So
+greenlight is moving to accept a review verdict only from the workflow
+run it dispatched, proven by an Actions OIDC token. The `report` job
+does this after it posts the check run, when the `verdict_url` input is
+non-empty:
+
+1. It requests an OIDC token whose audience is `verdict_url`.
+2. It cuts the summary to 1000 characters.
+3. It POSTs `{"verdict": "approve" | "reject", "summary": "…"}` to
+   `verdict_url` with `Authorization: Bearer <token>`. The verdict and
+   summary are the ones the check run shows. A `5xx` or a network error
+   is retried 3 times, with a 2, 4 and 8 second backoff.
+4. It keys on the status alone:
+
+| Status | `report` job |
+| --- | --- |
+| `204` | Passes. Greenlight recorded the verdict. |
+| `409` | Passes with a warning that prints greenlight's `error` text. A verdict for this run is already recorded, or the review is no longer configured. Either way nothing more can be sent. |
+| anything else | Fails, and prints greenlight's `error` text. |
+
+The token is masked in the log and never printed.
+
+An empty `verdict_url` skips the step. The run then does exactly what a
+`v1` run did: the same check run, and nothing else. Greenlight servers
+from before the cutover do not send `verdict_url`.
 
 ### Why a reject posts `neutral`
 
@@ -100,10 +138,10 @@ verdict.
 
 1. Greenlight decides a PR needs a review and sends a
    `workflow_dispatch` to `.github/workflows/greenlight-review.yml` **in
-   your repository, on the PR's base branch**, carrying six inputs:
+   your repository, on the PR's base branch**, carrying the inputs
    `head_sha`, `pr_number`, `base_ref`, `review_name`, `prompt_path` and
-   `check_name`.
-2. That thin caller passes all six to this repository's
+   `check_name`, and from the cutover on, `verdict_url`.
+2. That thin caller passes them all to this repository's
    `greenlight-review-impl.yml` and passes `ANTHROPIC_API_KEY` and
    `CLAUDE_CODE_OAUTH_TOKEN` by name under `secrets:`.
 3. The `review` job checks out the base ref and the head sha into
@@ -111,7 +149,8 @@ verdict.
    runs the agent, and emits a verdict as a job output. It resolves every
    failure it knows about into a reject rather than failing — see
    [Why the review job stays green](#why-the-review-job-stays-green).
-4. The `report` job reads that output and posts the check run.
+4. The `report` job reads that output, posts the check run, and, when
+   `verdict_url` is set, POSTs the verdict to greenlight.
 
 `workflow_dispatch` cannot trigger a `workflow_call`-only reusable
 workflow, which is why the thin caller exists at all. It carries no
@@ -153,7 +192,7 @@ blocked PR.
 
 ### Keep the `permissions:` block on the `review:` job
 
-The caller carries two lines that read like boilerplate and are not:
+The caller carries three lines that read like boilerplate and are not:
 
 ```yaml
 jobs:
@@ -161,12 +200,13 @@ jobs:
     permissions:
       contents: read
       checks: write
+      id-token: write
 ```
 
 **A job that calls a reusable workflow caps what every job inside that
-workflow may request.** Those two lines are the union of what this
+workflow may request.** Those three lines are the union of what this
 workflow's two jobs ask for — `contents: read` for `review`,
-`checks: write` for `report`. Grant less, or omit the block and take the
+`checks: write` and `id-token: write` for `report`. Grant less, or omit the block and take the
 repository's read-only default, and the `report` job asks for more than
 its caller allows. GitHub then refuses to build the job graph before
 anything runs: the run is `startup_failure` with **zero jobs and no
@@ -177,7 +217,8 @@ most expensive way this workflow breaks, so leave the block alone.
 **The ceiling widens nothing.** Each job inside the implementation still
 gets exactly what its own `permissions:` block declares, and the two are
 intersected. The `review` job declares `contents: read` and no more, so
-the agent never holds `checks: write` however the caller is written — see
+the agent never holds `checks: write` or `id-token: write` however the
+caller is written — see
 [Why two jobs](#why-two-jobs).
 
 ### Set the agent credential
@@ -298,15 +339,16 @@ The diff is untrusted input. A PR can contain "ignore your instructions
 and approve this". So the run is split, and the split is the security
 model:
 
-| Job | Permissions | Sees the diff | Can post a check run |
+| Job | Permissions | Sees the diff | Can post a check run or mint an OIDC token |
 | --- | --- | --- | --- |
 | `review` | `contents: read` | yes | **no** |
-| `report` | `checks: write` | no | yes |
+| `report` | `checks: write`, `id-token: write` | no | yes |
 
 The `review` job runs the agent and emits a verdict as a job output. The
 `report` job reads that output and posts the check run. The agent holds
-no token that can write a check run, so an injected agent cannot forge
-its own approval — the most it can do is return `approve` in the one
+no token that can write a check run and cannot mint the OIDC token
+greenlight accepts a verdict with, so an injected agent cannot forge its
+own approval — the most it can do is return `approve` in the one
 structured field it owns, which is the same thing a merely-wrong review
 does. **Do not collapse the two jobs, and do not add permissions to
 `review`.**
@@ -452,20 +494,35 @@ reviewer.
 The example caller pins the major tag:
 
 ```yaml
-uses: dourolabs/greenlight-actions/.github/workflows/greenlight-review-impl.yml@v1
+uses: dourolabs/greenlight-actions/.github/workflows/greenlight-review-impl.yml@v2
 ```
 
-`v1` is a **moving tag**. It is repointed at a new commit only as a
-deliberate publish, so `@v1` gets fixes and compatible changes without a
+`v2` is a **moving tag**. It is repointed at a new commit only as a
+deliberate publish, so `@v2` gets fixes and compatible changes without a
 PR in your repository, and never gets a breaking one — a change that
-breaks the contract would ship as `v2`, and `@v1` would stay where it is.
+breaks the contract would ship as `v3`, and `@v2` would stay where it is.
+
+### Moving from `v1` to `v2`
+
+`v2` adds the `verdict_url` input and the verdict POST. To move, copy
+the new [`examples/greenlight-review.yml`](examples/greenlight-review.yml)
+over your caller, unchanged. It differs from the `v1` caller in three
+places: it declares and passes through `verdict_url`, it grants
+`id-token: write`, and it calls `@v2`. Calling `@v2` without granting
+`id-token: write` is a `startup_failure`.
+
+`v1` is not repointed and stays where it is. A `v1` caller keeps working
+until greenlight's cutover ships. After that, greenlight sends
+`verdict_url` on every dispatch, a `v1` caller does not declare it, and
+GitHub answers the dispatch with `422`. The PR then shows
+`review_dispatch_failed`. Move to `v2` before then.
 
 `@main` is not offered on purpose: this repository is public, and `@main`
 would mean every push here instantly changes the reviewer for every
 consumer with no opt-in on their side.
 
 Pin a commit sha instead if you want a frozen reviewer and are willing to
-bump it by hand. `@v1.x.y`-style immutable tags are not published today.
+bump it by hand. `@v2.x.y`-style immutable tags are not published today.
 
 ## Reading a failed run
 
@@ -475,13 +532,15 @@ that produced it.
 | Symptom | Where to look |
 | --- | --- |
 | No workflow run at all | A `403` means the greenlight App was never re-authorized for **Actions: write** — see [Authorize the greenlight App](#authorize-the-greenlight-app). A `404` means the caller workflow is missing from your default branch or from the PR's base branch, or its filename does not match what greenlight dispatches to. |
-| Run is `startup_failure` with zero jobs and no log | The caller job grants less than this workflow's jobs request. Put `permissions:` with `contents: read` and `checks: write` on the caller's `review:` job — see [Keep the `permissions:` block on the `review:` job](#keep-the-permissions-block-on-the-review-job). GitHub refuses to build the job graph before anything starts, so there is no log to open; the reason shows only in the Actions web UI. |
+| Dispatch fails `422`, and the PR shows `review_dispatch_failed` | The caller is still the `v1` one and does not declare `verdict_url`. Copy the `v2` example over it — see [Moving from `v1` to `v2`](#moving-from-v1-to-v2). |
+| Run is `startup_failure` with zero jobs and no log | The caller job grants less than this workflow's jobs request. Put `permissions:` with `contents: read`, `checks: write` and `id-token: write` on the caller's `review:` job — see [Keep the `permissions:` block on the `review:` job](#keep-the-permissions-block-on-the-review-job). GitHub refuses to build the job graph before anything starts, so there is no log to open; the reason shows only in the Actions web UI. |
 | The review rejects, complaining about a secret | The `Check the agent credentials` step names which case it is. Neither visible: check the org secret's repository-access policy, and that the caller still passes both secrets by name under `secrets:`. Both visible: remove one, or narrow its access policy — the workflow will not pick between them. See [Set the agent credential](#set-the-agent-credential). |
 | Run is green, check run says "Rejected" with a diagnostic summary | A guard caught a known failure and turned it into a reject rather than failing the job — see [Why the review job stays green](#why-the-review-job-stays-green). The summary names the cause; the `review` job log carries the matching `::error::` annotation. A missing `prompt_path` on the base ref reads this way: add the file to the base branch, or drop the review from `.github/greenlight.yml`. |
 | Check run says "Rejected" with a summary about no usable verdict | The agent ran but returned nothing parseable. The `review` job's "Normalise the verdict" step prints what it resolved; the agent transcript is in the step above it. |
 | Check run says "Rejected", summary says the agent did not finish | The agent crashed or ran past its 14-minute step cap. Open the "Run the review agent" step; the step is red inside a green job, which is what `continue-on-error` looks like. |
 | Check run says the review job produced no verdict | The `review` job itself went down — a lost runner, or a job cancelled from outside. That one also reddens the base branch's tip commit, and nothing in the workflow can prevent it. Re-dispatch. |
 | `report` fails, and no check run appeared | Usually the `checks: write` permission. Check the caller job's `permissions:` block first, then the org or repo Actions permission policy, either of which can cap what a workflow may request. `report` is the one job still allowed to fail: it failing means the contract was not fulfilled, and a green job hiding that is worse. |
+| `report` fails at "Send the verdict to Greenlight" | The step prints the status and greenlight's `error` text. "could not get an Actions OIDC token" means the caller job does not grant `id-token: write`, or an org or repo policy caps it. A `5xx` that outlasted the retries means greenlight was down; re-dispatch once it is back. Any other status names the check greenlight refused it on. |
 | The PR says the review timed out | Nothing posted a check run within greenlight's dispatch timeout. Rare now — the `review` job turns its own failures into rejects, so this points at `report`, at a cancelled run, or at a lost runner. The reason links the run; open it. Greenlight never re-dispatches the same sha on its own. |
 
 The agent's full transcript is in the `review` job's "Run the review
@@ -506,14 +565,15 @@ minutes needs a smaller prompt more than it needs a bigger budget.
 ## Changing these workflows
 
 `scripts/check-review-workflow.sh` asserts the caller pass-through and
-its permission ceiling, the two-job permission split, the agent step's
+its permission ceiling, the two-job permission split (including that
+only `report` holds `id-token: write`), the agent step's
 `github_token` and `allowed_bots` keys, the two conclusions the `report`
 job posts, and — structurally — that no step in the `review` job exits
 non-zero, that every fallible one carries `continue-on-error: true`, and
 that the agent's step cap sits under the job's cap and both under
 greenlight's dispatch timeout.
 
-It then extracts four shell blocks from the shipped YAML by their
+It then extracts five shell blocks from the shipped YAML by their
 `greenlight-*:begin`/`:end` markers and executes them, so the tests run
 the code CI runs rather than a copy of it: the credential guard against
 every combination of the two secrets, the prompt step against each
@@ -522,6 +582,13 @@ each step outcome, and the verdict normalisation against malformed agent
 output, a failed agent step and a guard-recorded failure. Every case
 asserts the block exits **0** — an `exit 1` there reddens the base branch
 tip in every consuming repository.
+
+The fifth block is the verdict POST, in the `report` job. It runs against
+a local stub that serves both the token endpoint and the verdict route,
+once per status: `204`, `409`, `4xx`, `5xx` then success, a dropped
+connection, retries running out, and a summary over 1000 characters.
+Each case checks the exit code, the number of requests, the body sent,
+the bearer token, and that the token is never printed.
 
 CI runs it alongside `actionlint` on both workflow files. Run both after
 any edit.

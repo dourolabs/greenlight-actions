@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Verify the greenlight AI review workflows without a live dispatch.
 #
-# Six things nothing else catches:
+# Seven things nothing else catches:
 #
 #  1. The permission split. The `review` job must not be able to post a
-#     check run; the `report` job must. And the caller job has to grant
+#     check run or mint an OIDC token; the `report` job must be able to
+#     do both. And the caller job has to grant
 #     the union of the two: a caller grants a *ceiling*, so one that
 #     grants less than the impl's jobs request makes GitHub refuse to
 #     build the job graph — `startup_failure`, zero jobs, no log.
@@ -34,8 +35,12 @@
 #     `REVIEW_FATAL`. `exit 1` reads like the obvious way to handle a
 #     missing credential, so this is pinned structurally as well as
 #     behaviourally.
+#  7. The verdict POST. `report` sends the verdict to Greenlight's
+#     `verdict_url` with an OIDC token, retries 5xx and network errors,
+#     and keys on the status alone: 204 and 409 pass, anything else
+#     fails the job. An empty `verdict_url` sends nothing.
 #
-# (3), (4) and (6) all work the same way: the shell block is lifted out
+# (3), (4), (6) and (7) all work the same way: the shell block is lifted out
 # of the shipped YAML by its `greenlight-*:begin`/`:end` markers and run
 # here, so these test the code CI runs rather than a copy of it.
 #
@@ -62,15 +67,17 @@ fail() {
 }
 ok() { printf 'ok: %s\n' "$1"; }
 
-# The four shell blocks lifted out of the YAML further down, and one
-# trap for all of them: a second `trap ... EXIT` would replace the first
-# and leak.
+# The five shell blocks lifted out of the YAML further down, and one
+# trap for all of them and the stub server section 5 starts: a second
+# `trap ... EXIT` would replace the first and leak.
 guard_snippet=$(mktemp)
 prompt_snippet=$(mktemp)
 preflight_snippet=$(mktemp)
 verdict_snippet=$(mktemp)
+post_snippet=$(mktemp)
 scratch=$(mktemp -d)
-trap 'rm -rf "$guard_snippet" "$prompt_snippet" "$preflight_snippet" "$verdict_snippet" "$scratch"' EXIT
+stub_pid=
+trap '[ -n "$stub_pid" ] && kill "$stub_pid" 2>/dev/null; rm -rf "$guard_snippet" "$prompt_snippet" "$preflight_snippet" "$verdict_snippet" "$post_snippet" "$scratch"' EXIT
 
 # Keys of the `inputs:` mapping nested two levels under `on:` — i.e. the
 # `      name:` lines that follow `    inputs:` until the indentation
@@ -196,7 +203,7 @@ fi
 # and the symptom points nowhere — it cost two issues to find once.
 caller_review_block=$(job_block "$CALLER" review)
 
-for perm in 'contents: read' 'checks: write'; do
+for perm in 'contents: read' 'checks: write' 'id-token: write'; do
   if grep -qF "      ${perm}" <<<"$caller_review_block"; then
     ok "caller job grants ${perm}"
   else
@@ -207,10 +214,10 @@ done
 # The example is what every consumer installs, so its `uses:` has to name
 # this repository at the published major tag. `@main` would repoint every
 # consumer on every push here, with no opt-in on their side.
-if grep -qF '    uses: dourolabs/greenlight-actions/.github/workflows/greenlight-review-impl.yml@v1' "$CALLER"; then
-  ok "caller calls this repository's impl at @v1"
+if grep -qF '    uses: dourolabs/greenlight-actions/.github/workflows/greenlight-review-impl.yml@v2' "$CALLER"; then
+  ok "caller calls this repository's impl at @v2"
 else
-  fail "caller must call 'dourolabs/greenlight-actions/.github/workflows/greenlight-review-impl.yml@v1'"
+  fail "caller must call 'dourolabs/greenlight-actions/.github/workflows/greenlight-review-impl.yml@v2'"
 fi
 
 ## 2. The permission split — the security model, asserted on the YAML.
@@ -230,10 +237,31 @@ else
   ok "review job declares no write permission"
 fi
 
+# `id-token: write` is how a job mints the OIDC token Greenlight accepts
+# a verdict with. The agent reads untrusted input, so the job it runs in
+# must never hold it.
+if printf '%s\n' "$review_block" | grep -q '^ *id-token:'; then
+  fail "review job declares id-token; an injected agent could mint the token Greenlight accepts a verdict with"
+else
+  ok "review job declares no id-token permission"
+fi
+
 if printf '%s\n' "$report_block" | grep -q '^      checks: write$'; then
   ok "report job declares checks: write"
 else
   fail "report job must declare 'checks: write'"
+fi
+
+if printf '%s\n' "$report_block" | grep -q '^      id-token: write$'; then
+  ok "report job declares id-token: write"
+else
+  fail "report job must declare 'id-token: write': it mints the token the verdict POST carries"
+fi
+
+if printf '%s\n' "$report_block" | grep -qF "        if: \${{ inputs.verdict_url != '' }}"; then
+  ok "verdict POST step runs only when verdict_url is set"
+else
+  fail "the verdict POST step must be gated on 'if: \${{ inputs.verdict_url != '' }}', so an empty verdict_url behaves as v1 did"
 fi
 
 if printf '%s\n' "$report_block" | grep -q '^    needs: review$'; then
@@ -839,6 +867,211 @@ for case in "${cases[@]}"; do
   fi
   rm -f "$out"
 done
+
+## 5. The verdict POST, extracted from the YAML and executed.
+
+# A stub on 127.0.0.1 plays both ends: the Actions token endpoint and
+# Greenlight's verdict route. Each case writes the statuses the route
+# answers with, in order; `0` drops the connection with no reply, which
+# curl reports as `000`, the same as any network error. The stub logs
+# every verdict request it gets, so the case can count the retries and
+# read the body that was sent.
+
+extract_run_block "$IMPL" greenlight-verdict-post > "$post_snippet"
+
+if [ ! -s "$post_snippet" ]; then
+  fail "could not extract the verdict-post block from $IMPL"
+  exit 1
+fi
+
+stub_dir="$scratch/stub"
+mkdir -p "$stub_dir"
+cat > "$stub_dir/stub.py" <<'PY'
+import http.server, json, os, sys, urllib.parse
+
+d = sys.argv[1]
+TOKEN = "stub-oidc-token-do-not-print"
+VERDICT_URL_PATH = "/api/review-verdicts"
+
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def reply(self, status, body):
+        data = json.dumps(body).encode() if body is not None else b""
+        self.send_response(status)
+        if data:
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        u = urllib.parse.urlparse(self.path)
+        q = urllib.parse.parse_qs(u.query)
+        want_aud = open(os.path.join(d, "audience")).read()
+        if (u.path != "/token"
+                or q.get("api-version") != ["2.0"]
+                or q.get("audience") != [want_aud]
+                or self.headers.get("Authorization") != "Bearer stub-request-token"):
+            return self.reply(401, {"message": "bad token request"})
+        self.reply(200, {"value": TOKEN})
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(n).decode()
+        with open(os.path.join(d, "requests"), "a") as f:
+            f.write(json.dumps({
+                "path": self.path,
+                "auth": self.headers.get("Authorization"),
+                "body": body,
+            }) + "\n")
+        statuses = open(os.path.join(d, "statuses")).read().split()
+        count = sum(1 for _ in open(os.path.join(d, "requests")))
+        status = int(statuses[min(count, len(statuses)) - 1])
+        if status == 0:
+            self.close_connection = True
+            return
+        if self.path != VERDICT_URL_PATH:
+            return self.reply(404, {"error": "no such route", "status": 404})
+        self.reply(status, None if status == 204 else {"error": f"stub error {status}", "status": status})
+
+s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+open(os.path.join(d, "port"), "w").write(str(s.server_address[1]))
+s.serve_forever()
+PY
+
+: > "$stub_dir/audience"
+: > "$stub_dir/statuses"
+python3 "$stub_dir/stub.py" "$stub_dir" &
+stub_pid=$!
+for _ in $(seq 1 50); do
+  [ -s "$stub_dir/port" ] && break
+  sleep 0.1
+done
+if [ ! -s "$stub_dir/port" ]; then
+  fail "the verdict stub server did not start"
+  exit 1
+fi
+stub="http://127.0.0.1:$(cat "$stub_dir/port")"
+verdict_url="$stub/api/review-verdicts"
+python3 -c 'import sys, urllib.parse; sys.stdout.write(sys.argv[1])' "$verdict_url" > "$stub_dir/audience"
+
+long_summary=$(printf 'é%.0s' $(seq 1 1500))
+
+# conclusion | summary | statuses | expect exit | expected requests | expected verdict | output must contain | case label
+post_cases=(
+  "success|Looks good.|204|0|1|approve|recorded the verdict|an approve, recorded"
+  "neutral|Leaks a key.|204|0|1|reject|recorded the verdict|a reject, recorded"
+  "success|Fine.|409|0|1|approve|::warning::Greenlight did not record the verdict (409): stub error 409|a 409, passed with a warning"
+  "success|Fine.|400|1|1|approve|::error::Greenlight refused the verdict (400): stub error 400|a 400, failing the job"
+  "success|Fine.|401|1|1|approve|(401): stub error 401|a 401, failing the job"
+  "success|Fine.|403|1|1|approve|(403): stub error 403|a 403, failing the job"
+  "success|Fine.|404|1|1|approve|(404): stub error 404|a 404, failing the job"
+  "success|Fine.|503 502 204|0|3|approve|recorded the verdict|two 5xx, then recorded"
+  "success|Fine.|0 204|0|2|approve|recorded the verdict|a dropped connection, then recorded"
+  "success|Fine.|500 500 500 500|1|4|approve|refused the verdict (500)|four 5xx, failing after three retries"
+  "success|Fine.|503 503 503 409|0|4|approve|(409)|three 5xx, then a 409"
+  "neutral|LONG|204|0|1|reject|recorded the verdict|a summary over 1000 characters"
+)
+
+for case in "${post_cases[@]}"; do
+  IFS='|' read -r conclusion summary statuses expect_exit expect_requests expect_verdict expect_out label <<<"$case"
+  [ "$summary" = LONG ] && summary=$long_summary
+
+  work="$scratch/post-work"
+  rm -rf "$work"
+  mkdir -p "$work"
+  echo "$statuses" > "$stub_dir/statuses"
+  : > "$stub_dir/requests"
+  jq -n --arg c "$conclusion" --arg s "$summary" \
+    '{conclusion: $c, output: {title: "t", summary: $s}}' > "$work/payload.json"
+
+  set +e
+  out=$(cd "$work" && VERDICT_URL="$verdict_url" VERDICT_RETRY_DELAY=0 \
+    ACTIONS_ID_TOKEN_REQUEST_URL="$stub/token?api-version=2.0" \
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN=stub-request-token \
+    bash "$post_snippet" 2>&1)
+  status=$?
+  set -e
+
+  if [ "$status" -eq "$expect_exit" ]; then
+    ok "verdict POST exits ${expect_exit} for ${label}"
+  else
+    fail "verdict POST exited ${status}, expected ${expect_exit}, for ${label}: ${out}"
+  fi
+
+  got_requests=$(wc -l <"$stub_dir/requests")
+  if [ "$got_requests" -eq "$expect_requests" ]; then
+    ok "verdict POST sent ${expect_requests} request(s) for ${label}"
+  else
+    fail "verdict POST sent ${got_requests} request(s), expected ${expect_requests}, for ${label}"
+  fi
+
+  if grep -qF -- "$expect_out" <<<"$out"; then
+    ok "verdict POST log names the outcome for ${label}"
+  else
+    fail "verdict POST log lacks '${expect_out}' for ${label}: ${out}"
+  fi
+
+  # `::add-mask::` is the one line allowed to carry the token: GitHub
+  # reads it and masks the value in the rest of the log.
+  if grep -v '^::add-mask::' <<<"$out" | grep -qF stub-oidc-token-do-not-print; then
+    fail "verdict POST printed the OIDC token for ${label}"
+  else
+    ok "verdict POST does not print the OIDC token for ${label}"
+  fi
+
+  last=$(tail -1 "$stub_dir/requests")
+  if [ "$(jq -r .auth <<<"$last")" = "Bearer stub-oidc-token-do-not-print" ]; then
+    ok "verdict POST carries the OIDC token as bearer for ${label}"
+  else
+    fail "verdict POST did not carry the OIDC token as bearer for ${label}"
+  fi
+
+  sent=$(jq -r .body <<<"$last")
+  want_summary=$(jq -rn --arg s "$summary" '$s | .[0:1000]')
+  if [ "$(jq -r '.verdict' <<<"$sent")" = "$expect_verdict" ] \
+      && [ "$(jq -r '.summary' <<<"$sent")" = "$want_summary" ] \
+      && [ "$(jq -r 'keys | join(",")' <<<"$sent")" = "summary,verdict" ]; then
+    ok "verdict POST sends {verdict: ${expect_verdict}, summary} for ${label}"
+  else
+    fail "verdict POST sent '${sent}' for ${label}"
+  fi
+done
+
+if [ "$(jq -r '.summary | length' <<<"$sent")" -eq 1000 ]; then
+  ok "verdict POST cuts the summary to 1000 characters"
+else
+  fail "verdict POST sent a $(jq -r '.summary | length' <<<"$sent")-character summary, expected 1000"
+fi
+
+# No token permission: the job fails, names the missing permission, and
+# sends nothing.
+work="$scratch/post-work"
+: > "$stub_dir/requests"
+set +e
+out=$(cd "$work" && VERDICT_URL="$verdict_url" VERDICT_RETRY_DELAY=0 bash "$post_snippet" 2>&1)
+status=$?
+set -e
+if [ "$status" -ne 0 ] && grep -qF "id-token: write" <<<"$out" && [ ! -s "$stub_dir/requests" ]; then
+  ok "verdict POST fails and names id-token: write when no token can be had"
+else
+  fail "verdict POST without a token source exited ${status} and sent $(wc -l <"$stub_dir/requests") request(s): ${out}"
+fi
+
+# An empty verdict_url sends nothing and passes. The step's `if:` skips
+# it in CI already; this is the block's own guard.
+: > "$stub_dir/requests"
+if out=$(cd "$work" && VERDICT_URL='' bash "$post_snippet" 2>&1) && [ ! -s "$stub_dir/requests" ]; then
+  ok "verdict POST with an empty verdict_url sends nothing and exits 0"
+else
+  fail "verdict POST with an empty verdict_url did something: ${out}"
+fi
+
+kill "$stub_pid" 2>/dev/null || true
+wait "$stub_pid" 2>/dev/null || true
+stub_pid=
 
 echo
 if [ "$failures" -eq 0 ]; then
