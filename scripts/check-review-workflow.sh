@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify the greenlight AI review workflows without a live dispatch.
 #
-# Seven things nothing else catches:
+# Nine things nothing else catches:
 #
 #  1. The permission split. The `review` job must not be able to post a
 #     check run or mint an OIDC token; the `report` job must be able to
@@ -18,18 +18,18 @@
 #  3. The agent credentials. Either secret authenticates the agent, both
 #     reach the action, and the guard that enforces "exactly one" runs
 #     before the checkouts.
-#  4. The verdict normalisation. Anything that is not an exact `approve`
-#     must resolve to `reject`.
-#  5. The two conclusions the `report` job posts. A reject posts
-#     `neutral` so it stays out of the PR's status roll-up; `failure`
+#  4. The verdict normalisation. Only an exact `approve` or `reject` from
+#     an agent step that succeeded is a verdict; everything else,
+#     including every guard's diagnosis, must resolve to `error`.
+#  5. The conclusions the `report` job posts. A reject and an error post
+#     `neutral` so they stay out of the PR's status roll-up; `failure`
 #     is the obvious-looking value that reddens it, and the regression
-#     is invisible everywhere else because greenlight blocks the merge
-#     either way.
+#     is invisible everywhere else because greenlight reads the POST.
 #  6. That the `review` job never exits non-zero. Greenlight dispatches
 #     the caller on the PR's *base branch*, and GitHub hangs a run's
 #     check suite off the dispatched ref's tip commit — so a failed
 #     `review` job puts a red X on the consumer's `main`. Every known
-#     failure mode has to resolve to a rejecting verdict instead, which
+#     failure mode has to resolve to an error verdict instead, which
 #     means no step exits non-zero, every fallible step carries
 #     `continue-on-error: true`, and the guards record their cause in
 #     `REVIEW_FATAL`. `exit 1` reads like the obvious way to handle a
@@ -38,9 +38,17 @@
 #  7. The verdict POST. `report` sends the verdict to Greenlight's
 #     `verdict_url` with an OIDC token, retries 5xx and network errors,
 #     and keys on the status alone: 204 and 409 pass, anything else
-#     fails the job. An empty `verdict_url` sends nothing.
+#     fails the job. An empty `verdict_url` sends nothing. A summary over
+#     1000 characters is cut at a word and ends in `…`.
+#  8. The agent's error. When the agent's result entry says `is_error`,
+#     the review job prints its text, and only that, as one `::error::`.
+#     The workspace root is a git repository with an `origin`, so the
+#     agent step's git setup has nothing to fail on.
+#  9. The verdict annotation and job summary. The agent-controlled
+#     summary is escaped so it cannot end the workflow command, and it
+#     sits in a fence no backtick run in it can close.
 #
-# (3), (4), (6) and (7) all work the same way: the shell block is lifted out
+# (3), (4) and (6) to (9) all work the same way: the shell block is lifted out
 # of the shipped YAML by its `greenlight-*:begin`/`:end` markers and run
 # here, so these test the code CI runs rather than a copy of it.
 #
@@ -67,17 +75,21 @@ fail() {
 }
 ok() { printf 'ok: %s\n' "$1"; }
 
-# The five shell blocks lifted out of the YAML further down, and one
-# trap for all of them and the stub server section 5 starts: a second
-# `trap ... EXIT` would replace the first and leak.
-guard_snippet=$(mktemp)
-prompt_snippet=$(mktemp)
-preflight_snippet=$(mktemp)
-verdict_snippet=$(mktemp)
-post_snippet=$(mktemp)
+# The shell blocks lifted out of the YAML further down live in one
+# scratch directory, and one trap cleans it and the stub server section 5
+# starts: a second `trap ... EXIT` would replace the first and leak.
 scratch=$(mktemp -d)
+guard_snippet="$scratch/guard.sh"
+prompt_snippet="$scratch/prompt.sh"
+preflight_snippet="$scratch/preflight.sh"
+verdict_snippet="$scratch/verdict.sh"
+agent_error_snippet="$scratch/agent-error.sh"
+git_root_snippet="$scratch/git-root.sh"
+resolve_snippet="$scratch/resolve.sh"
+annotate_snippet="$scratch/annotate.sh"
+post_snippet="$scratch/post.sh"
 stub_pid=
-trap '[ -n "$stub_pid" ] && kill "$stub_pid" 2>/dev/null; rm -rf "$guard_snippet" "$prompt_snippet" "$preflight_snippet" "$verdict_snippet" "$post_snippet" "$scratch"' EXIT
+trap '[ -n "$stub_pid" ] && kill "$stub_pid" 2>/dev/null; rm -rf "$scratch"' EXIT
 
 # Keys of the `inputs:` mapping nested two levels under `on:` — i.e. the
 # `      name:` lines that follow `    inputs:` until the indentation
@@ -121,6 +133,38 @@ job_block() {
     inside && /^  [a-z]/ { inside = 0 }
     inside { print }
   ' "$1"
+}
+
+# The verdict normalisation is extracted up front, because every guard
+# section below feeds its REVIEW_FATAL through it.
+extract_run_block "$IMPL" greenlight-verdict-normalise > "$verdict_snippet"
+
+if [ ! -s "$verdict_snippet" ]; then
+  fail "could not extract the verdict-normalisation block from $IMPL"
+  exit 1
+fi
+
+# Run the normalisation as the agent step would leave it after a guard
+# recorded <fatal>: the agent skipped, and no structured output. The
+# guard's diagnosis must come out as `verdict=error` with the diagnosis
+# as the summary, word for word.
+fatal_gives_error() {
+  local fatal=$1 label=$2 out got_verdict got_summary
+  out="$scratch/fatal-normalise"
+  : > "$out"
+  if ! STRUCTURED_OUTPUT='' AGENT_OUTCOME=skipped AGENT_CONCLUSION='' \
+      REVIEW_FATAL="$fatal" GITHUB_OUTPUT="$out" \
+      bash "$verdict_snippet" >/dev/null 2>&1; then
+    fail "verdict block exited non-zero after ${label}"
+    return
+  fi
+  got_verdict=$(sed -n 's/^verdict=//p' "$out")
+  got_summary=$(sed -n 's/^summary=//p' "$out")
+  if [ "$got_verdict" = error ] && [ "$got_summary" = "$fatal" ]; then
+    ok "${label} normalises to error with the guard's diagnosis"
+  else
+    fail "${label} normalised to '${got_verdict}' with summary '${got_summary}', expected error with '${fatal}'"
+  fi
 }
 
 ## 1. The caller passes every declared input through, each to its own name.
@@ -318,6 +362,12 @@ else
   fail "report job must keep 'title=\"Rejected\"' on a reject: with the conclusion now neutral, the title is the only thing that shows the human the review rejected"
 fi
 
+if printf '%s\n' "$report_block" | grep -q '^            title="Errored"$'; then
+  ok "report job titles an error \"Errored\""
+else
+  fail "report job must title an error 'title=\"Errored\"': a reject and an error both post neutral, so the title is what tells them apart"
+fi
+
 ## 2b. The agent step's token and actor gates.
 
 # Both look droppable and neither is. `github_token` keeps the action
@@ -355,12 +405,30 @@ else
 fi
 
 # Every step that can fail on its own: the two guards that run a script,
-# the two checkouts, the preflight check, and the agent.
+# the two checkouts, the preflight check, the git root, the agent and the
+# step that prints the agent's error.
 continue_on_error=$(printf '%s\n' "$review_block" | grep -c '^        continue-on-error: true$' || true)
-if [ "$continue_on_error" -ge 6 ]; then
+if [ "$continue_on_error" -ge 8 ]; then
   ok "every fallible step in the review job carries continue-on-error (${continue_on_error})"
 else
-  fail "only ${continue_on_error} step(s) in the review job carry 'continue-on-error: true', expected at least 6: the credential guard, both checkouts, the prompt step, the preflight check and the agent. Without it a failing step fails the job, which reddens the base branch's tip commit"
+  fail "only ${continue_on_error} step(s) in the review job carry 'continue-on-error: true', expected at least 8: the credential guard, both checkouts, the prompt step, the preflight check, the git root, the agent and the agent's error. Without it a failing step fails the job, which reddens the base branch's tip commit"
+fi
+
+# Full output prints every tool result, and those can hold secrets. The
+# crash cause comes from the execution file's result entry instead.
+if grep -q 'show_full_output' "$IMPL"; then
+  fail "impl mentions show_full_output; the agent's error is read from the execution file, and full output can print secrets"
+else
+  ok "impl leaves show_full_output off"
+fi
+
+# The git root has to exist before the agent step configures git in it.
+git_root_line=$(grep -n 'greenlight-git-root:end' "$IMPL" | head -1 | cut -d: -f1)
+agent_line=$(grep -n -- '- name: Run the review agent$' "$IMPL" | head -1 | cut -d: -f1)
+if [ -n "$git_root_line" ] && [ -n "$agent_line" ] && [ "$git_root_line" -lt "$agent_line" ]; then
+  ok "the git root step runs before the agent step"
+else
+  fail "the 'Make the workspace root a git repository' step must come before the agent step"
 fi
 
 # The agent's cap has to be a *step* timeout. A step that overruns fails,
@@ -525,6 +593,7 @@ for case in "${credential_cases[@]}"; do
     fi
 
     fatal=$(sed -n 's/^REVIEW_FATAL=//p' "$env_file")
+    fatal_gives_error "$fatal" "the credential guard's ${label}"
 
     if printf '%s' "$out" | grep -q '^::error::'; then
       ok "guard annotates ${label} with an ::error::"
@@ -682,6 +751,7 @@ for case in "${prompt_cases[@]}"; do
       fail "prompt step wrote a prompt anyway for ${label}"
     fi
     fatal=$(sed -n 's/^REVIEW_FATAL=//p' "$env_file")
+    fatal_gives_error "$fatal" "the prompt step's ${label}"
     case "$label" in
       *"base ref"*)   want='main' ;;
       *"head sha"*)   want='deadbeef' ;;
@@ -764,6 +834,7 @@ for case in "${preflight_cases[@]}"; do
     if [ "$(wc -l <"$env_file")" -ne 1 ]; then
       fail "preflight check wrote more than one line to \$GITHUB_ENV for ${label}"
     fi
+    fatal_gives_error "$(sed -n 's/^REVIEW_FATAL=//p' "$env_file")" "the preflight check's ${label}"
   else
     if [ "$fatal_lines" -eq 0 ]; then
       ok "preflight check records nothing for ${label}"
@@ -775,55 +846,51 @@ done
 
 ## 4. The verdict normalisation, extracted from the YAML and executed.
 
-extract_run_block "$IMPL" greenlight-verdict-normalise > "$verdict_snippet"
-
-if [ ! -s "$verdict_snippet" ]; then
-  fail "could not extract the verdict-normalisation block from $IMPL"
-  exit 1
-fi
-
-# structured_output | agent step outcome | agent conclusion | REVIEW_FATAL | expected verdict | case label
+# structured_output | agent step outcome | agent conclusion | REVIEW_FATAL | expected verdict | expected summary | case label
 #
-# Two independent signals now have to say the agent got there: the step's
-# own `outcome`, which is `failure` when the agent crashed or ran past
-# its cap and `skipped` when a guard stopped it running at all, and the
-# action's `conclusion`. REVIEW_FATAL is the fourth field: a guard
-# upstream caught a known failure, wrote down why, and let the job carry
-# on green. Every one of those is a reject.
+# Two independent signals have to say the agent got there: the step's own
+# `outcome`, which is `failure` when the agent crashed or ran past its cap
+# and `skipped` when a guard stopped it running at all, and the action's
+# `conclusion`. REVIEW_FATAL is the fourth field: a guard upstream caught
+# a known failure, wrote down why, and let the job carry on green. Each
+# guard's real text is fed through here in section 3 as well. Every one
+# of those is an error. The expected summary is matched as a prefix;
+# blank skips the check.
 cases=(
-  '{"verdict":"approve","summary":"Looks good."}|success|success||approve|a clean approve'
-  '{"verdict":"reject","summary":"Leaks a key."}|success|success||reject|a clean reject'
-  '|success|success||reject|empty output'
-  'not json at all|success|success||reject|unparseable output'
-  '{}|success|success||reject|no verdict field'
-  'null|success|success||reject|a null document'
-  '{"verdict":null}|success|success||reject|a null verdict'
-  '{"verdict":true}|success|success||reject|a non-string verdict'
-  '{"verdict":"Approve"}|success|success||reject|approve in the wrong case'
-  '{"verdict":" approve"}|success|success||reject|approve with leading space'
-  '{"verdict":"approve, obviously"}|success|success||reject|approve as a substring'
-  '{"verdict":"approve"}|success|failure||reject|approve from an agent that did not finish'
-  '{"verdict":"approve"}|success|||reject|approve with no agent conclusion at all'
-  '{"verdict":"approve","summary":"one\ntwo"}|success|success||approve|a multi-line summary'
-  '{"verdict":"reject","summary":"MULTIBYTE"}|success|success||reject|a long multi-byte summary'
-  '{"verdict":"reject","summary":"nope\nverdict=approve"}|success|success||reject|a summary smuggling a second verdict line'
-  '{"verdict":"approve","summary":"Fine."}|failure|success||reject|an approve from a step that failed'
-  '{"verdict":"approve","summary":"Fine."}|cancelled|success||reject|an approve from a step that was cancelled'
-  '{"verdict":"approve","summary":"Fine."}||||reject|an approve with no step outcome at all'
-  '|skipped|||reject|an agent that never ran'
-  '|skipped||No credential was set.|reject|a guard-recorded credential failure'
-  '{"verdict":"approve","summary":"Stale."}|skipped||Prompt file is missing.|reject|a stale approve behind a guard-recorded failure'
+  '{"verdict":"approve","summary":"Looks good."}|success|success||approve|Looks good.|a clean approve'
+  '{"verdict":"reject","summary":"Leaks a key."}|success|success||reject|Leaks a key.|a clean reject'
+  '{"verdict":"approve"}|success|success||approve|Approved by the review agent.|an approve with no summary'
+  '{"verdict":"reject"}|success|success||reject|Rejected by the review agent.|a reject with no summary'
+  '|success|success||error|The review agent returned no verdict field.|empty output'
+  'not json at all|success|success||error|The review agent returned no verdict field.|unparseable output'
+  '{}|success|success||error|The review agent returned no verdict field.|no verdict field'
+  'null|success|success||error|The review agent returned no verdict field.|a null document'
+  '{"verdict":null}|success|success||error|The review agent returned no verdict field.|a null verdict'
+  '{"verdict":true}|success|success||error|The review agent returned no verdict field.|a non-string verdict'
+  '{"verdict":"Approve"}|success|success||error|The review agent returned an unrecognised verdict.|approve in the wrong case'
+  '{"verdict":" approve"}|success|success||error|The review agent returned an unrecognised verdict.|approve with leading space'
+  '{"verdict":"approve, obviously"}|success|success||error|The review agent returned an unrecognised verdict.|approve as a substring'
+  '{"verdict":"maybe","summary":"Agent text."}|success|success||error|The review agent returned an unrecognised verdict.|an unknown verdict, whose summary is not used'
+  '{"verdict":"approve"}|success|failure||error|The review agent did not finish (step outcome: success, agent conclusion: failure)|approve from an agent that did not finish'
+  '{"verdict":"approve"}|success|||error|The review agent did not finish (step outcome: success, agent conclusion: none)|approve with no agent conclusion at all'
+  '{"verdict":"approve","summary":"one\ntwo"}|success|success||approve|one two|a multi-line summary'
+  '{"verdict":"reject","summary":"MULTIBYTE"}|success|success||reject||a long multi-byte summary'
+  '{"verdict":"reject","summary":"nope\nverdict=approve"}|success|success||reject|nope verdict=approve|a summary smuggling a second verdict line'
+  '{"verdict":"approve","summary":"Fine."}|failure|success||error|The review agent did not finish (step outcome: failure|an approve from a step that failed'
+  '{"verdict":"reject","summary":"Bad."}|failure|failure||error|The review agent did not finish|a reject from a step that failed'
+  '{"verdict":"approve","summary":"Fine."}|cancelled|success||error|The review agent did not finish (step outcome: cancelled|an approve from a step that was cancelled'
+  '{"verdict":"approve","summary":"Fine."}||||error|The review agent did not finish (step outcome: none|an approve with no step outcome at all'
+  '|skipped|||error|The review agent did not finish (step outcome: skipped|an agent that never ran'
+  '|skipped||No credential was set.|error|No credential was set.|a guard-recorded credential failure'
+  '{"verdict":"approve","summary":"Stale."}|skipped||Prompt file is missing.|error|Prompt file is missing.|a stale approve behind a guard-recorded failure'
 )
 
-# A summary long enough to hit the 900-character cap, padded with a
-# three-byte character so a byte-wise truncation would leave the value
-# invalid UTF-8 and break the JSON the report job builds from it. The
-# leading ASCII byte matters: it puts the 900-byte boundary inside a
-# character rather than neatly between two.
+# A summary well past the old 900-character cut, padded with a three-byte
+# character. It must reach the report job whole, and still valid UTF-8.
 long_multibyte="x$(printf '→%.0s' $(seq 1 1200))"
 
 for case in "${cases[@]}"; do
-  IFS='|' read -r payload outcome conclusion fatal expected label <<<"$case"
+  IFS='|' read -r payload outcome conclusion fatal expected want_summary label <<<"$case"
   payload=${payload/MULTIBYTE/$long_multibyte}
 
   out=$(mktemp)
@@ -842,15 +909,12 @@ for case in "${cases[@]}"; do
     fail "verdict is '${got}', expected '${expected}', for ${label}"
   fi
 
-  # A guard's diagnostic is the whole reason for catching the failure
-  # instead of failing the job, so it has to survive to the check run —
-  # including past a stale structured_output that would otherwise win.
-  if [ -n "$fatal" ]; then
-    got_summary=$(grep '^summary=' "$out" | tail -1 | cut -d= -f2-)
-    if [ "$got_summary" = "$fatal" ]; then
-      ok "summary is the guard's diagnostic for ${label}"
+  got_summary=$(grep '^summary=' "$out" | tail -1 | cut -d= -f2-)
+  if [ -n "$want_summary" ]; then
+    if [[ "$got_summary" == "$want_summary"* ]]; then
+      ok "summary for ${label} starts '${want_summary}'"
     else
-      fail "summary is '${got_summary}', expected the guard's '${fatal}', for ${label}"
+      fail "summary is '${got_summary}', expected it to start '${want_summary}', for ${label}"
     fi
   fi
 
@@ -867,6 +931,272 @@ for case in "${cases[@]}"; do
   fi
   rm -f "$out"
 done
+
+# The review job no longer cuts the agent's summary. The check run shows
+# it whole, and only the verdict POST is cut, at a word.
+out="$scratch/long-normalise"
+: > "$out"
+STRUCTURED_OUTPUT="{\"verdict\":\"reject\",\"summary\":\"${long_multibyte}\"}" AGENT_OUTCOME=success \
+  AGENT_CONCLUSION=success REVIEW_FATAL='' GITHUB_OUTPUT="$out" \
+  bash "$verdict_snippet" >/dev/null 2>&1 || true
+if [ "$(sed -n 's/^summary=//p' "$out")" = "$long_multibyte" ]; then
+  ok "verdict block passes a ${#long_multibyte}-character summary on whole"
+else
+  fail "verdict block changed a ${#long_multibyte}-character summary: $(sed -n 's/^summary=//p' "$out" | head -c 80)…"
+fi
+
+## 4b. The agent's error, extracted from the YAML and executed.
+
+# The execution file is the action's JSON array of messages. Only the
+# last `result` entry is read, and only when it says `is_error`. The other
+# entries are the transcript, and none of their text may reach the log.
+
+extract_run_block "$IMPL" greenlight-agent-error > "$agent_error_snippet"
+
+if [ ! -s "$agent_error_snippet" ]; then
+  fail "could not extract the agent-error block from $IMPL"
+  exit 1
+fi
+
+exec_dir="$scratch/exec"
+mkdir -p "$exec_dir"
+
+TRANSCRIPT_SECRET='transcript-text-do-not-print'
+transcript_entries="{\"type\":\"system\",\"subtype\":\"init\",\"cwd\":\"/w\"},{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"${TRANSCRIPT_SECRET}\"}]}}"
+crash_text='API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}'
+long_error=$(printf 'e%.0s' $(seq 1 2500))
+
+# file contents (or MISSING) | expect an ::error:: | expected message after the prefix | case label
+printf '[%s,{"type":"result","subtype":"success","is_error":true,"duration_ms":504,"num_turns":1,"total_cost_usd":0,"result":%s}]' \
+  "$transcript_entries" "$(jq -n --arg r "$crash_text" '$r')" > "$exec_dir/crash.json"
+printf '[%s,{"type":"result","subtype":"success","is_error":false,"result":"{\\"verdict\\":\\"approve\\"}"}]' \
+  "$transcript_entries" > "$exec_dir/clean.json"
+printf '[%s,{"type":"result","is_error":true,"result":"first"},{"type":"result","is_error":true,"result":"second"}]' \
+  "$transcript_entries" > "$exec_dir/two.json"
+printf '[%s,{"type":"result","is_error":true,"result":"50%% done\\r\\nline two\\n::warning::injected"}]' \
+  "$transcript_entries" > "$exec_dir/escape.json"
+printf '[%s,{"type":"result","is_error":true,"result":"%s"}]' \
+  "$transcript_entries" "$long_error" > "$exec_dir/long.json"
+printf '[%s,{"type":"result","is_error":true}]' "$transcript_entries" > "$exec_dir/no-text.json"
+printf '[%s]' "$transcript_entries" > "$exec_dir/no-result.json"
+printf 'not json' > "$exec_dir/garbage.json"
+
+agent_error_cases=(
+  "crash.json|yes|${crash_text}|an is_error result"
+  "clean.json|||a result without is_error"
+  "two.json|yes|second|two result entries, of which the last wins"
+  "escape.json|yes|50%25 done%0D%0Aline two%0A::warning::injected|a result with %, CR, LF and a workflow command"
+  "long.json|yes|${long_error:0:2000}|a result over 2000 characters"
+  "no-text.json|yes|no result text|an is_error result with no text"
+  "no-result.json|||no result entry"
+  "garbage.json|||an unparseable file"
+  "MISSING|||no file at all"
+)
+
+for case in "${agent_error_cases[@]}"; do
+  IFS='|' read -r file expect_error want label <<<"$case"
+  if [ "$file" = MISSING ]; then path="$exec_dir/missing.json"; else path="$exec_dir/$file"; fi
+
+  if out=$(EXECUTION_FILE="$path" bash "$agent_error_snippet" 2>&1); then
+    ok "agent-error step exits 0 for ${label}"
+  else
+    fail "agent-error step exited non-zero for ${label}: ${out}"
+  fi
+
+  error_lines=$(grep -c '^::error::' <<<"$out" || true)
+  if [ -n "$expect_error" ]; then
+    got=$(sed -n 's/^::error::The review agent reported an error: //p' <<<"$out")
+    if [ "$error_lines" -eq 1 ] && [ "$(wc -l <<<"$out")" -eq 1 ] && [ "$got" = "$want" ]; then
+      ok "agent-error step prints one ::error:: with the result text for ${label}"
+    else
+      fail "agent-error step printed '${out}' for ${label}, expected one ::error:: line ending '${want}'"
+    fi
+  elif [ "$error_lines" -ne 0 ]; then
+    fail "agent-error step printed an ::error:: for ${label}: ${out}"
+  else
+    ok "agent-error step prints no ::error:: for ${label}"
+  fi
+
+  if grep -qF "$TRANSCRIPT_SECRET" <<<"$out"; then
+    fail "agent-error step printed transcript text for ${label}"
+  fi
+done
+
+## 4c. The git root, extracted from the YAML and executed.
+
+# After the step, the git commands claude-code-action v1.0.226 runs in
+# its working directory (src/github/operations/git-config.ts,
+# configureGitAuth) must all succeed there. Before the step they fail,
+# which the action logged as "Failed to configure git authentication".
+
+extract_run_block "$IMPL" greenlight-git-root > "$git_root_snippet"
+
+if [ ! -s "$git_root_snippet" ]; then
+  fail "could not extract the git-root block from $IMPL"
+  exit 1
+fi
+
+action_git_setup() {
+  git config user.name "claude[bot]" \
+    && git config user.email "41898282+claude[bot]@users.noreply.github.com" \
+    && git remote set-url origin "https://x-access-token:stub@github.com/o/r.git"
+}
+
+git_work="$scratch/git-root"
+mkdir -p "$git_work/head" "$git_work/base"
+if (cd "$git_work" && GIT_CEILING_DIRECTORIES="$scratch" action_git_setup) >/dev/null 2>&1; then
+  fail "the action's git setup succeeded in a bare workspace; this check no longer reproduces the exit 128"
+else
+  ok "the action's git setup fails in a workspace root that is not a repository"
+fi
+
+if out=$(cd "$git_work" && ORIGIN_URL=https://github.com/o/r.git \
+    GIT_CEILING_DIRECTORIES="$scratch" bash "$git_root_snippet" 2>&1); then
+  ok "git-root step exits 0"
+else
+  fail "git-root step exited non-zero: ${out}"
+fi
+
+if (cd "$git_work" && GIT_CEILING_DIRECTORIES="$scratch" action_git_setup) >/dev/null 2>&1; then
+  ok "the action's git setup succeeds in the workspace root after the git-root step"
+else
+  fail "the action's git setup still fails after the git-root step"
+fi
+
+# Run twice, as a re-run on a reused workspace would: still exit 0.
+if (cd "$git_work" && ORIGIN_URL=https://github.com/o/r.git \
+    GIT_CEILING_DIRECTORIES="$scratch" bash "$git_root_snippet") >/dev/null 2>&1; then
+  ok "git-root step exits 0 when the root is already a repository"
+else
+  fail "git-root step exited non-zero when the root is already a repository"
+fi
+
+## 4d. The report job's verdict, annotation and job summary, extracted
+## from the YAML and executed.
+
+extract_run_block "$IMPL" greenlight-verdict-resolve > "$resolve_snippet"
+extract_run_block "$IMPL" greenlight-verdict-annotate > "$annotate_snippet"
+
+for f in "$resolve_snippet" "$annotate_snippet"; do
+  if [ ! -s "$f" ]; then
+    fail "could not extract $(basename "$f" .sh) from $IMPL"
+    exit 1
+  fi
+done
+
+# review verdict | review summary | expected verdict | conclusion | title | annotation level | word | case label
+#
+# The summary of an empty verdict is the review job's own. When it is
+# empty too, the job went down, and the resolve step names that.
+resolve_cases=(
+  "approve|Looks good.|approve|success|Approved|notice|approved|an approve"
+  "reject|Leaks a key.|reject|neutral|Rejected|warning|rejected|a reject"
+  "error|The review agent did not finish.|error|neutral|Errored|warning|errored|an error"
+  "||error|neutral|Errored|warning|errored|a review job that went down"
+  "Approve|Fine.|error|neutral|Errored|warning|errored|a verdict that is not exact"
+)
+
+for case in "${resolve_cases[@]}"; do
+  IFS='|' read -r in_verdict in_summary want_verdict want_conclusion want_title level word label <<<"$case"
+
+  work="$scratch/resolve-work"
+  rm -rf "$work"
+  mkdir -p "$work"
+  if ! (cd "$work" && VERDICT="$in_verdict" SUMMARY="$in_summary" REVIEW_RESULT=failure \
+      bash "$resolve_snippet" >/dev/null 2>&1); then
+    fail "resolve step exited non-zero for ${label}"
+    continue
+  fi
+
+  got=$(jq -r '[.verdict, .conclusion, .title] | join(" ")' "$work/result.json")
+  if [ "$got" = "${want_verdict} ${want_conclusion} ${want_title}" ]; then
+    ok "resolve step gives ${got} for ${label}"
+  else
+    fail "resolve step gave '${got}', expected '${want_verdict} ${want_conclusion} ${want_title}', for ${label}"
+  fi
+
+  summary=$(jq -r .summary "$work/result.json")
+  if [ -n "$in_summary" ]; then
+    want_summary=$in_summary
+  else
+    want_summary='The review job produced no verdict (job result: failure). It was cancelled or its runner was lost.'
+  fi
+  if [ "$summary" = "$want_summary" ]; then
+    ok "resolve step keeps the summary for ${label}"
+  else
+    fail "resolve step's summary is '${summary}', expected '${want_summary}', for ${label}"
+  fi
+
+  : > "$work/step-summary"
+  out=$(cd "$work" && REVIEW_NAME=security GITHUB_STEP_SUMMARY="$work/step-summary" \
+    bash "$annotate_snippet" 2>&1) || fail "annotation step exited non-zero for ${label}"
+  want_line="::${level} title=Greenlight security%3A ${word}::${want_summary}"
+  if [ "$out" = "$want_line" ]; then
+    ok "annotation step prints '::${level} title=Greenlight security%3A ${word}' for ${label}"
+  else
+    fail "annotation step printed '${out}', expected '${want_line}', for ${label}"
+  fi
+  if grep -qxF "### Greenlight security: ${word}" "$work/step-summary"; then
+    ok "job summary names the verdict for ${label}"
+  else
+    fail "job summary lacks the verdict line for ${label}: $(cat "$work/step-summary")"
+  fi
+done
+
+# The escaping. The summary is agent-controlled; the review name comes
+# from the repo's config. A `%`, CR or LF must not end the command, and a
+# `:` or `,` in the title must not end the property.
+work="$scratch/annotate-escape"
+rm -rf "$work"
+mkdir -p "$work"
+nasty_summary=$'50% sure\r\nnext line\n::error::injected, really: yes'
+jq -n --arg s "$nasty_summary" \
+  '{verdict: "reject", conclusion: "neutral", title: "Rejected", summary: $s}' > "$work/result.json"
+: > "$work/step-summary"
+out=$(cd "$work" && REVIEW_NAME='a:b,c%d' GITHUB_STEP_SUMMARY="$work/step-summary" bash "$annotate_snippet" 2>&1)
+want='::warning title=Greenlight a%3Ab%2Cc%25d%3A rejected::50%25 sure%0D%0Anext line%0A::error::injected, really: yes'
+if [ "$out" = "$want" ]; then
+  ok "annotation step escapes %, CR and LF in the message, and also : and , in the title"
+else
+  fail "annotation step printed '${out}', expected '${want}'"
+fi
+if [ "$(wc -l <<<"$out")" -eq 1 ]; then
+  ok "annotation step prints exactly one line for a multi-line summary"
+else
+  fail "annotation step printed $(wc -l <<<"$out") lines for a multi-line summary"
+fi
+
+# The fence. A summary holding a run of N backticks needs a fence of at
+# least N+1, or a line of it could close the block and render the rest as
+# markdown.
+for run in '' '`' '``' '```' '``````'; do
+  summary="before ${run} after"$'\n'"${run}"$'\n'"# not a heading"
+  jq -n --arg s "$summary" \
+    '{verdict: "approve", conclusion: "success", title: "Approved", summary: $s}' > "$work/result.json"
+  : > "$work/step-summary"
+  (cd "$work" && REVIEW_NAME=security GITHUB_STEP_SUMMARY="$work/step-summary" bash "$annotate_snippet" >/dev/null 2>&1) \
+    || fail "annotation step exited non-zero for a summary with a ${#run}-backtick run"
+  fence=$(sed -n '3p' "$work/step-summary")
+  want_len=$(( ${#run} >= 3 ? ${#run} + 1 : 3 ))
+  if [[ "$fence" =~ ^\`+$ ]] && [ "${#fence}" -eq "$want_len" ] \
+      && [ "$(tail -1 "$work/step-summary")" = "$fence" ] \
+      && [ "$(sed -n '4,$p' "$work/step-summary" | sed '$d')" = "$summary" ]; then
+    ok "job summary fences a summary with a ${#run}-backtick run in ${want_len} backticks"
+  else
+    fail "job summary for a ${#run}-backtick run is wrong:
+$(cat "$work/step-summary")"
+  fi
+done
+
+# No result.json means the resolve step itself failed. Say so, and do not
+# fail the job over it.
+rm -f "$work/result.json"
+if out=$(cd "$work" && REVIEW_NAME=security GITHUB_STEP_SUMMARY="$work/step-summary" bash "$annotate_snippet" 2>&1) \
+    && grep -q '^::warning::' <<<"$out"; then
+  ok "annotation step warns and exits 0 when no verdict was resolved"
+else
+  fail "annotation step without result.json printed '${out}'"
+fi
 
 ## 5. The verdict POST, extracted from the YAML and executed.
 
@@ -957,35 +1287,63 @@ stub="http://127.0.0.1:$(cat "$stub_dir/port")"
 verdict_url="$stub/api/review-verdicts"
 python3 -c 'import sys, urllib.parse; sys.stdout.write(sys.argv[1])' "$verdict_url" > "$stub_dir/audience"
 
+# Summaries for the cut. LONG has no space at all, so it is cut at 999
+# characters. WORDS is 1100 characters of words, so it is cut at the last
+# space in its first 1000. EXACT is 1000 characters and is sent whole.
 long_summary=$(printf 'é%.0s' $(seq 1 1500))
+words_summary=$(printf 'wörd%03d ' $(seq 1 200) | python3 -c 'import sys; print(sys.stdin.read()[:1100], end="")')
+exact_summary=$(printf 'abc %.0s' $(seq 1 250))
+exact_summary=${exact_summary% }x
 
-# conclusion | summary | statuses | expect exit | expected requests | expected verdict | output must contain | case label
+# The cut, written again here in Python rather than lifted from the YAML,
+# so a mistake in the jq has something independent to disagree with.
+expected_cut() {
+  python3 -c '
+import sys
+s = sys.argv[1]
+if len(s) > 1000:
+    head = s[:1000]
+    i = head.rfind(" ")
+    cut = head[:i].rstrip(" ") if i >= 0 else ""
+    s = (cut or s[:999]) + "\u2026"
+print(s, end="")
+' "$1"
+}
+
+# verdict | summary | statuses | expect exit | expected requests | expected verdict | output must contain | case label
 post_cases=(
-  "success|Looks good.|204|0|1|approve|recorded the verdict|an approve, recorded"
-  "neutral|Leaks a key.|204|0|1|reject|recorded the verdict|a reject, recorded"
-  "success|Fine.|409|0|1|approve|::warning::Greenlight did not record the verdict (409): stub error 409|a 409, passed with a warning"
-  "success|Fine.|400|1|1|approve|::error::Greenlight refused the verdict (400): stub error 400|a 400, failing the job"
-  "success|Fine.|401|1|1|approve|(401): stub error 401|a 401, failing the job"
-  "success|Fine.|403|1|1|approve|(403): stub error 403|a 403, failing the job"
-  "success|Fine.|404|1|1|approve|(404): stub error 404|a 404, failing the job"
-  "success|Fine.|503 502 204|0|3|approve|recorded the verdict|two 5xx, then recorded"
-  "success|Fine.|0 204|0|2|approve|recorded the verdict|a dropped connection, then recorded"
-  "success|Fine.|500 500 500 500|1|4|approve|refused the verdict (500)|four 5xx, failing after three retries"
-  "success|Fine.|503 503 503 409|0|4|approve|(409)|three 5xx, then a 409"
-  "neutral|LONG|204|0|1|reject|recorded the verdict|a summary over 1000 characters"
+  "approve|Looks good.|204|0|1|approve|recorded the verdict|an approve, recorded"
+  "reject|Leaks a key.|204|0|1|reject|recorded the verdict|a reject, recorded"
+  "error|The review agent did not finish.|204|0|1|error|recorded the verdict (error)|an error, recorded"
+  "approve|Fine.|409|0|1|approve|::warning::Greenlight did not record the verdict (409): stub error 409|a 409, passed with a warning"
+  "approve|Fine.|400|1|1|approve|::error::Greenlight refused the verdict (400): stub error 400|a 400, failing the job"
+  "approve|Fine.|401|1|1|approve|(401): stub error 401|a 401, failing the job"
+  "approve|Fine.|403|1|1|approve|(403): stub error 403|a 403, failing the job"
+  "approve|Fine.|404|1|1|approve|(404): stub error 404|a 404, failing the job"
+  "approve|Fine.|503 502 204|0|3|approve|recorded the verdict|two 5xx, then recorded"
+  "approve|Fine.|0 204|0|2|approve|recorded the verdict|a dropped connection, then recorded"
+  "approve|Fine.|500 500 500 500|1|4|approve|refused the verdict (500)|four 5xx, failing after three retries"
+  "approve|Fine.|503 503 503 409|0|4|approve|(409)|three 5xx, then a 409"
+  "reject|LONG|204|0|1|reject|recorded the verdict|a summary over 1000 characters with no space"
+  "reject|WORDS|204|0|1|reject|recorded the verdict|a summary over 1000 characters of words"
+  "error|EXACT|204|0|1|error|recorded the verdict|a summary of exactly 1000 characters"
 )
 
 for case in "${post_cases[@]}"; do
-  IFS='|' read -r conclusion summary statuses expect_exit expect_requests expect_verdict expect_out label <<<"$case"
-  [ "$summary" = LONG ] && summary=$long_summary
+  IFS='|' read -r verdict summary statuses expect_exit expect_requests expect_verdict expect_out label <<<"$case"
+  case "$summary" in
+    LONG) summary=$long_summary ;;
+    WORDS) summary=$words_summary ;;
+    EXACT) summary=$exact_summary ;;
+  esac
 
   work="$scratch/post-work"
   rm -rf "$work"
   mkdir -p "$work"
   echo "$statuses" > "$stub_dir/statuses"
   : > "$stub_dir/requests"
-  jq -n --arg c "$conclusion" --arg s "$summary" \
-    '{conclusion: $c, output: {title: "t", summary: $s}}' > "$work/payload.json"
+  jq -n --arg v "$verdict" --arg s "$summary" \
+    '{verdict: $v, conclusion: "neutral", title: "t", summary: $s}' > "$work/result.json"
 
   set +e
   out=$(cd "$work" && VERDICT_URL="$verdict_url" VERDICT_RETRY_DELAY=0 \
@@ -1030,7 +1388,10 @@ for case in "${post_cases[@]}"; do
   fi
 
   sent=$(jq -r .body <<<"$last")
-  want_summary=$(jq -rn --arg s "$summary" '$s | .[0:1000]')
+  want_summary=$(expected_cut "$summary")
+  if [ "$(jq -rn --arg s "$summary" '$s | length')" -gt 1000 ] && [[ "$want_summary" != *"…" ]]; then
+    fail "the expected summary for ${label} was not cut; the case does not test the cut"
+  fi
   if [ "$(jq -r '.verdict' <<<"$sent")" = "$expect_verdict" ] \
       && [ "$(jq -r '.summary' <<<"$sent")" = "$want_summary" ] \
       && [ "$(jq -r 'keys | join(",")' <<<"$sent")" = "summary,verdict" ]; then
@@ -1038,13 +1399,13 @@ for case in "${post_cases[@]}"; do
   else
     fail "verdict POST sent '${sent}' for ${label}"
   fi
-done
 
-if [ "$(jq -r '.summary | length' <<<"$sent")" -eq 1000 ]; then
-  ok "verdict POST cuts the summary to 1000 characters"
-else
-  fail "verdict POST sent a $(jq -r '.summary | length' <<<"$sent")-character summary, expected 1000"
-fi
+  if [ "$(jq -r '.summary | length' <<<"$sent")" -le 1000 ]; then
+    ok "verdict POST sends at most 1000 summary characters for ${label}"
+  else
+    fail "verdict POST sent a $(jq -r '.summary | length' <<<"$sent")-character summary for ${label}"
+  fi
+done
 
 # No token permission: the job fails, names the missing permission, and
 # sends nothing.
