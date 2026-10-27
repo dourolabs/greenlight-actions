@@ -7,12 +7,15 @@ name: greenlight AI review (implementation)
 # that workflow calls this one. All the logic lives here so a repo
 # upgrades by moving the ref it calls, not by editing its own YAML.
 #
-# The contract with greenlight is one sentence: post a check run named
-# `check_name` against `head_sha`, `success` to approve and `neutral`
-# to reject. Greenlight keys on nothing else. `neutral` rather than
-# `failure` because GitHub counts `neutral` as a successful check
-# status, so a reject leaves the PR's status roll-up green instead of
-# reddening it. See README.md in this repository.
+# The contract with greenlight is one POST: the `report` job sends
+# `approve`, `reject` or `error` to `verdict_url` with the run's Actions
+# OIDC token, and greenlight keys on nothing else. `error` means the run
+# ended without a verdict from the agent, and greenlight re-runs it
+# rather than recording a decision. The check run that `report` also
+# posts against `head_sha` is for display: `success` for an approve,
+# `neutral` for a reject or an error. `neutral` rather than `failure`
+# because GitHub counts `neutral` as a successful check status, so the
+# PR's status roll-up stays green. See README.md in this repository.
 #
 # The other half of staying green is that the `review` job below does
 # not fail. Greenlight dispatches this workflow on the PR's **base
@@ -21,7 +24,7 @@ name: greenlight AI review (implementation)
 # the base branch's head commit, which for an ordinary PR is `main`. A
 # job that exits non-zero therefore reddens `main` over a failure that
 # has nothing to do with `main`. Every known failure mode is caught,
-# recorded, and resolved into a rejecting verdict instead.
+# recorded, and resolved into an `error` verdict instead.
 
 on:
   workflow_call:
@@ -60,7 +63,7 @@ on:
       # `required: true`, because `workflow_call` cannot express "exactly one
       # of". The `Check the agent credentials` step on the `review` job below
       # enforces it instead. It says so in an `::error::` annotation and turns
-      # the run into a rejecting check run naming the cause — which is the
+      # the run into an errored check run naming the cause — which is the
       # diagnostic `required: true` used to buy, without the red X on the base
       # branch that a failed job would leave.
       ANTHROPIC_API_KEY:
@@ -86,10 +89,10 @@ jobs:
   # `main`. Instead every step that can fail carries
   # `continue-on-error: true`, every known failure mode is recorded in
   # `REVIEW_FATAL` by the guard step that detects it, and the last step
-  # turns whatever happened into `verdict=reject` with a summary naming
+  # turns whatever happened into `verdict=error` with a summary naming
   # the cause. The job stays green; the PR still does not merge, because
-  # the reject is what greenlight reads. See README.md, "Why the review
-  # job stays green".
+  # greenlight records no decision for an error and re-runs the review.
+  # See README.md, "Why the review job stays green".
   review:
     name: review
     runs-on: ubuntu-latest
@@ -97,7 +100,7 @@ jobs:
       contents: read
     # A backstop, not the budget. The budget is `timeout-minutes` on the
     # agent step below, because a *step* timeout fails that step — which
-    # `continue-on-error` turns into a reject — while a *job* timeout
+    # `continue-on-error` turns into an error verdict — while a *job* timeout
     # cancels the job outright and leaves nothing running to catch it.
     # Two minutes above the step's cap, and both comfortably under the
     # dispatch timeout greenlight is getting (20 minutes by default), so
@@ -106,7 +109,7 @@ jobs:
     # `REVIEW_FATAL` is the channel the guard steps below use. Whichever
     # one catches a known failure writes the reason to `$GITHUB_ENV`;
     # every later step gates on `env.REVIEW_FATAL == ''`, and
-    # `Normalise the verdict` turns it into the rejecting summary. It is
+    # `Normalise the verdict` turns it into the error summary. It is
     # deliberately not declared at job level: a job-level `env:` and a
     # `$GITHUB_ENV` write of the same name have an ordering nobody should
     # have to remember, and an unset variable already compares equal to
@@ -167,7 +170,7 @@ jobs:
             echo "REVIEW_FATAL=${fatal}" >> "$GITHUB_ENV"
             # Exit 0, not 1. A non-zero exit fails the job, and this job's
             # check run sits on the base branch's tip commit. The verdict
-            # step below turns REVIEW_FATAL into a reject instead.
+            # step below turns REVIEW_FATAL into an error verdict instead.
             exit 0
           fi
 
@@ -319,7 +322,7 @@ jobs:
       # about — a bad `jq`, a runner that lost its disk — sets no
       # REVIEW_FATAL and would otherwise let the agent run on a prompt
       # that was never composed. This turns any such step into the same
-      # rejecting verdict, so nothing between here and the agent can fail
+      # error verdict, so nothing between here and the agent can fail
       # the job silently.
       #
       # greenlight-preflight-guard:begin
@@ -360,6 +363,34 @@ jobs:
           echo "every step before the agent succeeded"
       # greenlight-preflight-guard:end
 
+      # claude-code-action configures git in its working directory, which
+      # is the workspace root: `git config user.name`, then `git remote
+      # set-url origin`. The root is not a repository, because the two
+      # checkouts sit in `base/` and `head/`, so the action logged "Failed
+      # to configure git authentication ... exit 128" on every run, and
+      # authors read that as the cause of the verdict. v1.0.226 has no
+      # input to skip it. An empty repository with an `origin` remote
+      # gives both commands something to act on. The URL carries no
+      # credential; the action writes this job's own `contents: read`
+      # token into it, as it does in any checkout.
+      #
+      # greenlight-git-root:begin
+      - name: Make the workspace root a git repository
+        id: gitroot
+        if: env.REVIEW_FATAL == ''
+        continue-on-error: true
+        env:
+          ORIGIN_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          set -uo pipefail
+
+          if git init -q . && git remote add origin "${ORIGIN_URL}"; then
+            echo "the workspace root is a git repository with an origin remote"
+          else
+            echo "could not make the workspace root a git repository; the agent step may log 'Failed to configure git authentication'. That error is expected and does not affect the verdict."
+          fi
+      # greenlight-git-root:end
+
       - name: Run the review agent
         id: agent
         if: env.REVIEW_FATAL == ''
@@ -367,11 +398,11 @@ jobs:
         # sandbox that runs out of disk, a prompt that never converges.
         # Every one of those used to fail the job and redden the base
         # branch's tip. Here they fail only this step; `Normalise the
-        # verdict` below reads the outcome and rejects.
+        # verdict` below reads the outcome and sends `error`.
         continue-on-error: true
         # The real time budget, and a step cap rather than the job cap on
         # purpose — a step that overruns fails, and a failed step is
-        # already a reject, while a job that overruns is cancelled and
+        # already an error verdict, while a job that overruns is cancelled and
         # cannot be caught from inside.
         timeout-minutes: 14
         uses: anthropics/claude-code-action@v1.0.226
@@ -409,9 +440,52 @@ jobs:
             --model claude-opus-5
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","reject"]},"summary":{"type":"string"}},"required":["verdict","summary"],"additionalProperties":false}'
 
-      # Normalise everything that happened above into exactly `approve` or
-      # `reject`. The agent controls STRUCTURED_OUTPUT, so it arrives via
-      # `env:` and is never interpolated into this script.
+      # The agent's result message, printed when the agent reports an
+      # error. Full output stays off, because it prints every tool result
+      # and those can hold secrets. The result message is the agent's
+      # last word only, such as an API error or "Claude did not return
+      # structured_output", and GitHub masks any secret value that
+      # reaches the log. Escaping `%`, `\r` and `\n` keeps the whole text
+      # inside the one `::error::` command, so no line of it can run a
+      # workflow command of its own.
+      #
+      # greenlight-agent-error:begin
+      - name: Print the agent's error
+        id: agent_error
+        if: ${{ !cancelled() && steps.agent.outputs.execution_file != '' }}
+        continue-on-error: true
+        env:
+          EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+        run: |
+          set -uo pipefail
+
+          if [ ! -f "${EXECUTION_FILE}" ]; then
+            echo "no execution file at '${EXECUTION_FILE}'"
+            exit 0
+          fi
+
+          result=$(jq -c '[.[]? | objects | select(.type == "result")] | last // empty' \
+            "${EXECUTION_FILE}" 2>/dev/null) || result=''
+          if [ -z "${result}" ]; then
+            echo "the execution file holds no result entry"
+            exit 0
+          fi
+
+          if [ "$(jq -r '.is_error == true' <<<"${result}")" != true ]; then
+            echo "the agent reported no error"
+            exit 0
+          fi
+
+          message=$(jq -r '(.result // "no result text") | tostring | .[0:2000]' <<<"${result}")
+          message=${message//'%'/'%25'}
+          message=${message//$'\r'/'%0D'}
+          message=${message//$'\n'/'%0A'}
+          echo "::error::The review agent reported an error: ${message}"
+      # greenlight-agent-error:end
+
+      # Normalise everything that happened above into exactly `approve`,
+      # `reject` or `error`. The agent controls STRUCTURED_OUTPUT, so it
+      # arrives via `env:` and is never interpolated into this script.
       #
       # greenlight-verdict-normalise:begin
       - name: Normalise the verdict
@@ -424,60 +498,58 @@ jobs:
         run: |
           set -uo pipefail
 
-          # Anything that is not an unambiguous approve is a reject. Empty
-          # output, malformed JSON, a missing field, a novel verdict string,
-          # a failed agent run and every failure a guard step caught on the
-          # way here all land here. Defaulting to approve on a malformed
-          # verdict is the single failure this whole design exists to
-          # prevent, so the only path to `approve` is an exact match.
-          verdict=reject
+          # Anything that is not an exact `approve` or `reject` from an
+          # agent step that succeeded is an error: greenlight records no
+          # decision for it and re-runs the review. Empty output, malformed
+          # JSON, a missing field, a novel verdict string, a failed or
+          # skipped agent step and every failure a guard step caught on
+          # the way here all land here. Defaulting to approve on a
+          # malformed verdict is the single failure this whole design
+          # exists to prevent, so the only path to `approve` is an exact
+          # match.
+          verdict=error
           summary='The review agent produced no usable verdict.'
 
           if [ -n "${REVIEW_FATAL:-}" ]; then
             # A guard step upstream caught a known failure, wrote down why,
             # and let the job carry on green rather than reddening the base
-            # branch's tip commit. Its diagnostic is the summary, and the
-            # reject it produces is what blocks the PR.
+            # branch's tip commit. Its diagnostic is the summary.
             summary="${REVIEW_FATAL}"
           elif [ "${AGENT_OUTCOME:-}" != "success" ] || [ "${AGENT_CONCLUSION:-}" != "success" ]; then
             # Two independent signals, and both have to say success. The
             # outcome is the step's: `failure` when the agent crashed or
             # overran its cap, `skipped` when it never ran. The conclusion
-            # is the action's own. Either one short of success is a reject.
-            summary="The review agent did not finish (step outcome: ${AGENT_OUTCOME:-none}, agent conclusion: ${AGENT_CONCLUSION:-none}). It crashed, ran past its time cap, or stopped early. Rejecting."
-          elif ! parsed=$(printf '%s' "${STRUCTURED_OUTPUT}" | jq -e -r '.verdict | strings' 2>/dev/null); then
-            summary='The review agent returned no verdict field. Rejecting.'
+            # is the action's own. Either one short of success is an error.
+            summary="The review agent did not finish (step outcome: ${AGENT_OUTCOME:-none}, agent conclusion: ${AGENT_CONCLUSION:-none}). It crashed, ran past its time cap, or stopped early. The step log above names the cause when the agent reported one."
+          elif ! parsed=$(printf '%s' "${STRUCTURED_OUTPUT}" | jq -e -r '.verdict | strings' 2>/dev/null) \
+              || [ -z "${parsed}" ]; then
+            summary='The review agent returned no verdict field.'
           elif [ "${parsed}" = "approve" ]; then
             verdict=approve
             summary='Approved by the review agent.'
           elif [ "${parsed}" = "reject" ]; then
+            verdict=reject
             summary='Rejected by the review agent.'
           else
-            summary="The review agent returned an unrecognised verdict. Rejecting."
+            summary='The review agent returned an unrecognised verdict.'
           fi
 
-          # The agent's own summary is preferred when it gave one, but it
-          # never changes the verdict. jq does the newline stripping and
-          # the truncation: it slices by codepoint, where `cut -c` would
-          # happily halve a multi-byte character and hand the report job
-          # a string that is no longer valid UTF-8.
-          #
-          # Skipped when a guard recorded a cause. The agent did not run in
-          # that case, so anything in STRUCTURED_OUTPUT is stale, and the
-          # guard's diagnostic is the whole point of catching the failure.
-          if [ -z "${REVIEW_FATAL:-}" ]; then
+          # The agent's own summary, whole, when it gave one with an
+          # approve or a reject. It never changes the verdict. An error
+          # keeps the cause above instead: the agent's text says nothing
+          # about why its verdict was unusable.
+          if [ "${verdict}" != error ]; then
             agent_summary=$(printf '%s' "${STRUCTURED_OUTPUT}" \
-              | jq -e -r '(.summary | strings)[0:900] | gsub("[\n\r]"; " ")' 2>/dev/null) || agent_summary=''
+              | jq -e -r '.summary | strings' 2>/dev/null) || agent_summary=''
             if [ -n "${agent_summary}" ]; then
               summary="${agent_summary}"
             fi
           fi
 
-          # Belt and braces on the fixed summaries above, and load-bearing
-          # rather than cosmetic: the summary is agent-controlled, and a
-          # newline in a `key=value` line written to $GITHUB_OUTPUT would
-          # let it append a second `verdict=` line that wins over the
-          # real one.
+          # Load-bearing rather than cosmetic: the summary is
+          # agent-controlled, and a newline in a `key=value` line written
+          # to $GITHUB_OUTPUT would let it append a second `verdict=` line
+          # that wins over the real one.
           summary=$(printf '%s' "${summary}" | tr '\n\r' '  ')
 
           echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"
@@ -497,9 +569,9 @@ jobs:
     # a skipped `report` posts nothing — the PR then waits out
     # greenlight's dispatch timeout with no reason to read. `review` is
     # built not to fail, but a lost or cancelled runner can still take it
-    # down, and a reject carrying "the review job did not produce a
-    # verdict" beats silence. `!cancelled()` rather than `always()` so a
-    # human who cancels the run is obeyed.
+    # down, and an error carrying "the review job produced no verdict"
+    # beats silence. `!cancelled()` rather than `always()` so a human who
+    # cancels the run is obeyed.
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
@@ -507,43 +579,49 @@ jobs:
       id-token: write
     timeout-minutes: 5
     steps:
-      - name: Post the check run
+      # Turns the review job's outputs into `result.json`, which every
+      # later step reads, so the check run, the annotation and the POST
+      # all say the same thing.
+      #
+      # greenlight-verdict-resolve:begin
+      - name: Resolve the verdict
         env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          CHECK_NAME: ${{ inputs.check_name }}
-          HEAD_SHA: ${{ inputs.head_sha }}
-          REVIEW_NAME: ${{ inputs.review_name }}
           VERDICT: ${{ needs.review.outputs.verdict }}
           SUMMARY: ${{ needs.review.outputs.summary }}
           REVIEW_RESULT: ${{ needs.review.result }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
 
           # Second, independent exact match. `needs.review.outputs.verdict`
           # is empty when the review job did not reach its last step, and
-          # empty is a reject like everything else that is not `approve`.
+          # empty is an error like everything else that is not `approve`
+          # or `reject`.
           #
-          # A reject posts `neutral`, not `failure`. GitHub has no way to
-          # keep a check run out of a commit's status roll-up, and
-          # `conclusion` is the only lever: GitHub counts `success`,
-          # `skipped` and `neutral` as successful check statuses, so a
-          # `neutral` reject leaves the roll-up green while `failure`
-          # turns it red. The `title` still reads "Rejected", which is
-          # what GitHub renders beside the check name, so the human in
-          # the merge box still sees the verdict and the reason.
+          # A reject and an error post `neutral`, not `failure`. GitHub
+          # has no way to keep a check run out of a commit's status
+          # roll-up, and `conclusion` is the only lever: GitHub counts
+          # `success`, `skipped` and `neutral` as successful check
+          # statuses, so a `neutral` check run leaves the roll-up green
+          # while `failure` turns it red. The `title` says "Rejected" or
+          # "Errored", which is what GitHub renders beside the check
+          # name, so the human in the merge box still sees the verdict
+          # and the reason.
           #
-          # Greenlight's own reviewer gate reads this conclusion and
-          # still blocks the merge. Do not "fix" this back to `failure`;
-          # scripts/check-review-workflow.sh fails if you do. See
-          # README.md, "Why a reject posts `neutral`".
+          # Greenlight reads the verdict POST, not this conclusion. Do not
+          # "fix" this back to `failure`; scripts/check-review-workflow.sh
+          # fails if you do. See README.md, "Why a reject posts `neutral`".
           if [ "${VERDICT:-}" = "approve" ]; then
+            verdict=approve
             conclusion=success
             title="Approved"
-          else
+          elif [ "${VERDICT:-}" = "reject" ]; then
+            verdict=reject
             conclusion=neutral
             title="Rejected"
+          else
+            verdict=error
+            conclusion=neutral
+            title="Errored"
           fi
 
           # The review job resolves every failure it knows about into a
@@ -553,24 +631,111 @@ jobs:
           if [ -n "${SUMMARY:-}" ]; then
             summary="${SUMMARY}"
           else
-            summary="The review job produced no verdict (job result: ${REVIEW_RESULT:-unknown}). It was cancelled or its runner was lost. Rejecting; re-dispatch the review."
+            summary="The review job produced no verdict (job result: ${REVIEW_RESULT:-unknown}). It was cancelled or its runner was lost."
           fi
 
           jq -n \
-            --arg name "${CHECK_NAME}" \
-            --arg head_sha "${HEAD_SHA}" \
+            --arg verdict "${verdict}" \
             --arg conclusion "${conclusion}" \
             --arg title "${title}" \
             --arg summary "${summary}" \
+            '{verdict: $verdict, conclusion: $conclusion, title: $title, summary: $summary}' \
+            > result.json
+          echo "verdict: ${verdict}"
+      # greenlight-verdict-resolve:end
+
+      # Puts the verdict at the top of the run page as an annotation, and
+      # in the job summary. `if: !cancelled()` so the run page still says
+      # what happened when posting the check run fails.
+      #
+      # The summary is agent-controlled. In a workflow command, `%`, `\r`
+      # and `\n` are escaped as `%25`, `%0D` and `%0A`, so the summary
+      # cannot end the command and start one of its own. A property such
+      # as `title` also needs `:` and `,` escaped, or the runner reads
+      # them as the end of the property list.
+      #
+      # greenlight-verdict-annotate:begin
+      - name: Show the verdict on the run page
+        if: ${{ !cancelled() }}
+        env:
+          REVIEW_NAME: ${{ inputs.review_name }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f result.json ]; then
+            echo "::warning::no verdict was resolved, so there is nothing to show"
+            exit 0
+          fi
+
+          verdict=$(jq -r .verdict result.json)
+          summary=$(jq -r .summary result.json)
+          case "${verdict}" in
+            approve) level=notice; word=approved ;;
+            reject) level=warning; word=rejected ;;
+            *) level=warning; word=errored ;;
+          esac
+
+          escape_data() {
+            local s=$1
+            s=${s//'%'/'%25'}
+            s=${s//$'\r'/'%0D'}
+            s=${s//$'\n'/'%0A'}
+            printf '%s' "$s"
+          }
+          escape_property() {
+            local s
+            s=$(escape_data "$1")
+            s=${s//:/'%3A'}
+            s=${s//,/'%2C'}
+            printf '%s' "$s"
+          }
+
+          title=$(escape_property "Greenlight ${REVIEW_NAME}: ${word}")
+          message=$(escape_data "${summary}")
+          echo "::${level} title=${title}::${message}"
+
+          # The summary goes in a fenced code block, so the agent's text
+          # renders as text and not as markdown. The fence is one backtick
+          # longer than the longest backtick run in the summary, so no
+          # line of the summary can close it.
+          fence='```'
+          while [[ "${summary}" == *"${fence}"* ]]; do
+            fence="${fence}\`"
+          done
+          {
+            echo "### Greenlight ${REVIEW_NAME}: ${word}"
+            echo
+            echo "${fence}"
+            printf '%s\n' "${summary}"
+            echo "${fence}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+      # greenlight-verdict-annotate:end
+
+      - name: Post the check run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CHECK_NAME: ${{ inputs.check_name }}
+          HEAD_SHA: ${{ inputs.head_sha }}
+          REVIEW_NAME: ${{ inputs.review_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # The full summary. The check run is where a human reads it, and
+          # only the verdict POST below is cut.
+          jq \
+            --arg name "${CHECK_NAME}" \
+            --arg head_sha "${HEAD_SHA}" \
             --arg details_url "${RUN_URL}" \
             '{
               name: $name,
               head_sha: $head_sha,
               status: "completed",
-              conclusion: $conclusion,
+              conclusion: .conclusion,
               details_url: $details_url,
-              output: { title: $title, summary: $summary }
-            }' > payload.json
+              output: { title: .title, summary: .summary }
+            }' result.json > payload.json
 
           gh api \
             --method POST \
@@ -579,15 +744,15 @@ jobs:
             "repos/${REPO}/check-runs" \
             --input payload.json > /dev/null
 
-          echo "posted check run '${CHECK_NAME}' (${REVIEW_NAME}) on ${HEAD_SHA}: ${conclusion}"
+          echo "posted check run '${CHECK_NAME}' (${REVIEW_NAME}) on ${HEAD_SHA}: $(jq -r .conclusion result.json)"
 
       # Greenlight reads the verdict from this POST, not from the check
       # run above, which is for display. The token proves to Greenlight
       # which workflow run sent the verdict, so it can accept a verdict
       # only from the run it dispatched. An empty `verdict_url` (an older
       # Greenlight server) skips this step, and the run does what `v1`
-      # did. The verdict and summary are read back from the check run's
-      # payload, so the POST always says what the check run shows.
+      # did. The verdict and summary are read from `result.json`, so the
+      # POST always says what the check run shows.
       #
       # greenlight-verdict-post:begin
       - name: Send the verdict to Greenlight
@@ -615,13 +780,21 @@ jobs:
           fi
           echo "::add-mask::${token}"
 
-          # 2. The body. Greenlight caps `summary` at 1000 characters;
-          #    `jq` slices by character, so a multi-byte summary stays
-          #    valid UTF-8.
+          # 2. The body. Greenlight caps `summary` at 1000 characters. A
+          #    longer one is cut at the last space in its first 1000
+          #    characters, and `…` marks the cut, so the result is at most
+          #    1000 characters and ends on a whole word. A summary with no
+          #    space there is cut at 999. `jq` slices by character, so a
+          #    multi-byte summary stays valid UTF-8.
           jq '{
-                verdict: (if .conclusion == "success" then "approve" else "reject" end),
-                summary: (.output.summary | .[0:1000])
-              }' payload.json > verdict.json
+                verdict: .verdict,
+                summary: (.summary
+                  | if length <= 1000 then .
+                    else .[0:1000]
+                      | (if test(" ") then sub(" [^ ]*$"; "") | sub(" +$"; "") else "" end) as $cut
+                      | (if $cut == "" then .[0:999] else $cut end) + "…"
+                    end)
+              }' result.json > verdict.json
 
           # 3. POST, retrying 5xx and network errors (`000`) 3 times.
           delay=${VERDICT_RETRY_DELAY:-2}
