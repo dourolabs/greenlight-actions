@@ -648,6 +648,14 @@ jobs:
       # in the job summary. `if: !cancelled()` so the run page still says
       # what happened when posting the check run fails.
       #
+      # `continue-on-error: true` because this step is display only. The
+      # two steps after it run only on `success()`, so without it a jq
+      # error or a failed `$GITHUB_STEP_SUMMARY` write would skip the
+      # check run and the verdict POST, and Greenlight would wait out its
+      # dispatch timeout. It stays before them so the annotation still
+      # shows when either of them fails. scripts/check-review-workflow.sh
+      # fails if this step can skip them.
+      #
       # The summary is agent-controlled. In a workflow command, `%`, `\r`
       # and `\n` are escaped as `%25`, `%0D` and `%0A`, so the summary
       # cannot end the command and start one of its own. A property such
@@ -657,6 +665,7 @@ jobs:
       # greenlight-verdict-annotate:begin
       - name: Show the verdict on the run page
         if: ${{ !cancelled() }}
+        continue-on-error: true
         env:
           REVIEW_NAME: ${{ inputs.review_name }}
         run: |

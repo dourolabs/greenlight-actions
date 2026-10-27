@@ -46,7 +46,8 @@
 #     agent step's git setup has nothing to fail on.
 #  9. The verdict annotation and job summary. The agent-controlled
 #     summary is escaped so it cannot end the workflow command, and it
-#     sits in a fence no backtick run in it can close.
+#     sits in a fence no backtick run in it can close. A failure in the
+#     annotation step cannot skip the check run or the verdict POST.
 #
 # (3), (4) and (6) to (9) all work the same way: the shell block is lifted out
 # of the shipped YAML by its `greenlight-*:begin`/`:end` markers and run
@@ -1196,6 +1197,45 @@ if out=$(cd "$work" && REVIEW_NAME=security GITHUB_STEP_SUMMARY="$work/step-summ
   ok "annotation step warns and exits 0 when no verdict was resolved"
 else
   fail "annotation step without result.json printed '${out}'"
+fi
+
+# The annotation step is display only, and it must not be able to stop
+# the verdict. The check run and the verdict POST run only on
+# `success()`, so a failure in an earlier step skips them unless that
+# step carries `continue-on-error: true`. A later step that runs on
+# `always()` or `!cancelled()` is safe either way.
+#
+# One line per step in the report job: <name>|<if>|<continue-on-error>.
+report_steps=$(printf '%s\n' "$report_block" | awk '
+  function flush() { if (name != "") print name "|" cond "|" coe }
+  /^      - name: / { flush(); name = $0; sub(/^      - name: /, "", name); cond = ""; coe = ""; next }
+  /^        if: / { cond = $0; sub(/^        if: /, "", cond); next }
+  /^        continue-on-error: / { coe = $0; sub(/^        continue-on-error: /, "", coe); next }
+  END { flush() }
+')
+annotate_step='Show the verdict on the run page'
+annotate_line=$(grep -n "^${annotate_step}|" <<<"$report_steps" | cut -d: -f1 || true)
+if [ -z "$annotate_line" ]; then
+  fail "the report job has no '${annotate_step}' step"
+else
+  annotate_coe=$(sed -n "${annotate_line}p" <<<"$report_steps" | cut -d'|' -f3)
+  for step in 'Post the check run' 'Send the verdict to Greenlight'; do
+    line=$(grep -n "^${step}|" <<<"$report_steps" | cut -d: -f1 || true)
+    if [ -z "$line" ]; then
+      fail "the report job has no '${step}' step"
+      continue
+    fi
+    cond=$(sed -n "${line}p" <<<"$report_steps" | cut -d'|' -f2)
+    if [ "$line" -lt "$annotate_line" ]; then
+      ok "'${step}' runs before the annotation step, so the annotation cannot skip it"
+    elif [ "$annotate_coe" = "true" ]; then
+      ok "the annotation step carries continue-on-error, so it cannot skip '${step}'"
+    elif [[ "$cond" == *'always()'* || "$cond" == *'!cancelled()'* ]]; then
+      ok "'${step}' runs on '${cond}', so the annotation step cannot skip it"
+    else
+      fail "a failed '${annotate_step}' step skips '${step}': give the annotation step 'continue-on-error: true', or move it after '${step}'. Otherwise Greenlight gets no verdict and waits out its dispatch timeout"
+    fi
+  done
 fi
 
 ## 5. The verdict POST, extracted from the YAML and executed.
