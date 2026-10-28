@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify the greenlight AI review workflows without a live dispatch.
 #
-# Nine things nothing else catches:
+# Ten things nothing else catches:
 #
 #  1. The permission split. The `review` job must not be able to post a
 #     check run or mint an OIDC token; the `report` job must be able to
@@ -48,8 +48,12 @@
 #     summary is escaped so it cannot end the workflow command, and it
 #     sits in a fence no backtick run in it can close. A failure in the
 #     annotation step cannot skip the check run or the verdict POST.
+# 10. The PR diff. The agent has no shell, so a step writes the diff,
+#     the file list and the commits to `./review/` before the prompt is
+#     composed. The prompt points at them and tells the agent not to run
+#     git, builds or tests, and the agent step allows no shell tool.
 #
-# (3), (4) and (6) to (9) all work the same way: the shell block is lifted out
+# (3), (4) and (6) to (10) all work the same way: the shell block is lifted out
 # of the shipped YAML by its `greenlight-*:begin`/`:end` markers and run
 # here, so these test the code CI runs rather than a copy of it.
 #
@@ -86,6 +90,7 @@ preflight_snippet="$scratch/preflight.sh"
 verdict_snippet="$scratch/verdict.sh"
 agent_error_snippet="$scratch/agent-error.sh"
 git_root_snippet="$scratch/git-root.sh"
+review_diff_snippet="$scratch/review-diff.sh"
 resolve_snippet="$scratch/resolve.sh"
 annotate_snippet="$scratch/annotate.sh"
 post_snippet="$scratch/post.sh"
@@ -406,13 +411,13 @@ else
 fi
 
 # Every step that can fail on its own: the two guards that run a script,
-# the two checkouts, the preflight check, the git root, the agent and the
-# step that prints the agent's error.
+# the two checkouts, the diff step, the preflight check, the git root,
+# the agent and the step that prints the agent's error.
 continue_on_error=$(printf '%s\n' "$review_block" | grep -c '^        continue-on-error: true$' || true)
-if [ "$continue_on_error" -ge 8 ]; then
+if [ "$continue_on_error" -ge 9 ]; then
   ok "every fallible step in the review job carries continue-on-error (${continue_on_error})"
 else
-  fail "only ${continue_on_error} step(s) in the review job carry 'continue-on-error: true', expected at least 8: the credential guard, both checkouts, the prompt step, the preflight check, the git root, the agent and the agent's error. Without it a failing step fails the job, which reddens the base branch's tip commit"
+  fail "only ${continue_on_error} step(s) in the review job carry 'continue-on-error: true', expected at least 9: the credential guard, both checkouts, the diff step, the prompt step, the preflight check, the git root, the agent and the agent's error. Without it a failing step fails the job, which reddens the base branch's tip commit"
 fi
 
 # Full output prints every tool result, and those can hold secrets. The
@@ -451,6 +456,18 @@ if printf '%s\n' "$agent_block" | grep -q '^        continue-on-error: true$'; t
   ok "the agent step carries continue-on-error"
 else
   fail "the agent step must carry 'continue-on-error: true'; an agent that crashes or overruns would otherwise fail the job and redden the base branch's tip commit"
+fi
+
+# No shell for the agent. It holds the agent credential and reads
+# untrusted code, and it can edit `head/.git/config`, so even read-only
+# git could run a program through `core.pager`, `diff.external`, a
+# textconv driver or `core.fsmonitor`. The diff step writes the diff
+# instead. Comments are skipped so the reason can be written down.
+agent_code=$(printf '%s\n' "$agent_block" | grep -v '^ *#' || true)
+if printf '%s\n' "$agent_code" | grep -q 'Bash'; then
+  fail "the agent step names a Bash tool (in --allowedTools, --allowed-tools or elsewhere); the agent gets no shell, and ./review holds the diff instead"
+else
+  ok "the agent step allows no Bash tool"
 fi
 
 # The step cap has to leave the job cap room to run the verdict step, and
@@ -843,6 +860,249 @@ for case in "${preflight_cases[@]}"; do
       fail "preflight check overwrote or invented a REVIEW_FATAL for ${label}: $(cat "$env_file")"
     fi
   fi
+done
+
+## 3e. The PR diff, extracted from the YAML and executed.
+
+# The agent cannot run git, so the diff step writes the change to
+# `./review/` and the prompt step points at it. The diff step runs
+# after the head checkout and before the prompt step, which reads its
+# outputs. It never sets REVIEW_FATAL: without a diff the agent still
+# compares `./head` with `./base`.
+
+for marker in greenlight-review-diff:begin greenlight-review-diff:end; do
+  if grep -q "# ${marker}$" "$IMPL"; then
+    ok "impl carries the ${marker} marker"
+  else
+    fail "impl is missing the '# ${marker}' marker around the diff step"
+  fi
+done
+
+head_line=$(grep -n -- '- name: Check out the head sha$' "$IMPL" | head -1 | cut -d: -f1)
+diff_line=$(grep -n -- '- name: Write the PR diff for the agent$' "$IMPL" | head -1 | cut -d: -f1)
+prompt_line=$(grep -n -- '- name: Compose the prompt$' "$IMPL" | head -1 | cut -d: -f1)
+if [ -n "$head_line" ] && [ -n "$diff_line" ] && [ -n "$prompt_line" ] \
+   && [ "$head_line" -lt "$diff_line" ] && [ "$diff_line" -lt "$prompt_line" ]; then
+  ok "the diff step runs after the head checkout and before the prompt step"
+else
+  fail "the 'Write the PR diff for the agent' step must come after 'Check out the head sha' and before 'Compose the prompt'"
+fi
+
+extract_run_block "$IMPL" greenlight-review-diff > "$review_diff_snippet"
+
+if [ ! -s "$review_diff_snippet" ]; then
+  fail "could not extract the diff block from $IMPL"
+  exit 1
+fi
+
+if grep -q 'REVIEW_FATAL' "$review_diff_snippet"; then
+  fail "the diff step mentions REVIEW_FATAL; a missing diff must not stop the review"
+else
+  ok "the diff step never sets REVIEW_FATAL"
+fi
+
+cap=$(sed -n 's/^PR_DIFF_CAP_BYTES=\([0-9][0-9]*\)$/\1/p' "$review_diff_snippet" | head -1)
+if [ -n "$cap" ]; then
+  ok "the diff step caps pr.diff at PR_DIFF_CAP_BYTES=${cap}"
+else
+  fail "the diff step must set PR_DIFF_CAP_BYTES to a number"
+  cap=400000
+fi
+
+# A sample repository laid out as the two checkouts leave it: `head/`
+# at the PR's tip, with the base branch at `origin/main`.
+diff_work="$scratch/review-diff"
+make_sample() {
+  rm -rf "$diff_work"
+  mkdir -p "$diff_work/base" "$diff_work/head"
+  printf 'base\n' > "$diff_work/base/README"
+  (
+    cd "$diff_work/head"
+    export GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com \
+      GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.com
+    git init -q -b main .
+    printf 'one\n' > kept.txt
+    printf 'gone\n' > removed.txt
+    git add . && git commit -qm 'base commit'
+    git update-ref refs/remotes/origin/main HEAD
+    git checkout -q -b pr
+    printf 'one\ntwo\n' > kept.txt
+    git rm -q removed.txt
+    git add kept.txt && git commit -qm 'change kept.txt'
+  ) >/dev/null 2>&1
+}
+
+run_diff_step() {
+  : > "$diff_work/output"
+  : > "$diff_work/env"
+  (cd "$diff_work" && BASE_REF="${1:-main}" GITHUB_OUTPUT="$diff_work/output" \
+     GITHUB_ENV="$diff_work/env" bash "$review_diff_snippet" >/dev/null 2>&1)
+}
+
+diff_output() { sed -n "s/^$1=//p" "$diff_work/output"; }
+
+# A small change: everything written whole.
+make_sample
+if run_diff_step; then
+  ok "diff step exits 0 on a small change"
+else
+  fail "diff step exited non-zero on a small change"
+fi
+if [ "$(diff_output status)" = complete ] \
+   && grep -q '^+two$' "$diff_work/review/pr.diff" \
+   && grep -q '^M	kept.txt$' "$diff_work/review/files.txt" \
+   && grep -q '^D	removed.txt$' "$diff_work/review/files.txt" \
+   && grep -q ' change kept.txt$' "$diff_work/review/commits.txt" \
+   && ! grep -q 'base commit' "$diff_work/review/commits.txt"; then
+  ok "diff step writes pr.diff, files.txt and commits.txt for a small change"
+else
+  fail "diff step did not write the expected ./review files: status '$(diff_output status)'"
+fi
+if [ ! -e "$diff_work/review/full.diff" ]; then
+  ok "diff step leaves no scratch file in ./review"
+else
+  fail "diff step left review/full.diff behind"
+fi
+
+# A config the agent could have planted in head/.git/config, and a
+# PR-authored .gitattributes asking for a textconv driver. None of them
+# may run.
+make_sample
+planted="$diff_work/planted-ran"
+cat > "$diff_work/plant.sh" <<EOF
+#!/bin/sh
+touch "$planted"
+EOF
+chmod +x "$diff_work/plant.sh"
+(
+  cd "$diff_work/head"
+  git config diff.external "$diff_work/plant.sh"
+  git config core.fsmonitor "$diff_work/plant.sh"
+  git config core.pager "$diff_work/plant.sh"
+  git config diff.planted.textconv "$diff_work/plant.sh"
+  printf '*.txt diff=planted\n' > .gitattributes
+  GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com \
+    GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.com \
+    git -c core.fsmonitor=false add .gitattributes
+  GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com \
+    GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.com \
+    git -c core.fsmonitor=false commit -qm 'attributes'
+) >/dev/null 2>&1
+rm -f "$planted"
+run_diff_step || true
+if [ ! -e "$planted" ] && [ "$(diff_output status)" = complete ]; then
+  ok "diff step runs no external diff, textconv, fsmonitor or pager from head/.git/config"
+else
+  fail "diff step ran a program from head/.git/config or .gitattributes (or did not complete)"
+fi
+
+# A change bigger than the cap: pr.diff is cut at a line, files.txt is not.
+make_sample
+(
+  cd "$diff_work/head"
+  for i in $(seq 1 40); do
+    head -c $((cap / 20)) /dev/zero | tr '\0' 'x' | fold -w 100 > "big-${i}.txt"
+  done
+  git add . && GIT_CONFIG_NOSYSTEM=1 GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@example.com \
+    GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@example.com git commit -qm 'big'
+) >/dev/null 2>&1
+if run_diff_step; then
+  ok "diff step exits 0 on a change over the cap"
+else
+  fail "diff step exited non-zero on a change over the cap"
+fi
+pr_bytes=$(wc -c < "$diff_work/review/pr.diff")
+if [ "$(diff_output status)" = truncated ] && [ "$pr_bytes" -le "$cap" ] \
+   && [ "$pr_bytes" -gt $((cap - 200)) ] \
+   && [ "$(diff_output diff_bytes)" -gt "$cap" ] \
+   && [ "$(diff_output cap_bytes)" = "$cap" ] \
+   && [ "$(tail -c1 "$diff_work/review/pr.diff" | od -An -c | tr -d ' ')" = '\n' ]; then
+  ok "diff step cuts pr.diff at a line boundary under the cap (${pr_bytes} of $(diff_output diff_bytes) bytes)"
+else
+  fail "diff step did not cut pr.diff to ${cap} bytes at a line: status '$(diff_output status)', ${pr_bytes} bytes"
+fi
+if [ "$(grep -c '^A	big-[0-9]*\.txt$' "$diff_work/review/files.txt")" -eq 40 ]; then
+  ok "files.txt lists every file when pr.diff is cut"
+else
+  fail "files.txt does not list all 40 added files when pr.diff is cut"
+fi
+
+# No merge base: status failed, no ./review, exit 0, no REVIEW_FATAL.
+make_sample
+if run_diff_step no-such-branch; then
+  ok "diff step exits 0 when the base branch is missing"
+else
+  fail "diff step exited non-zero when the base branch is missing"
+fi
+if [ "$(diff_output status)" = failed ] && [ ! -e "$diff_work/review" ] \
+   && [ ! -s "$diff_work/env" ]; then
+  ok "diff step reports failed, removes ./review and sets no REVIEW_FATAL without a merge base"
+else
+  fail "diff step without a merge base: status '$(diff_output status)', env '$(cat "$diff_work/env")'"
+fi
+
+# The prompt the agent gets, for each diff status.
+compose_prompt() {
+  local work="$scratch/prompt-diff"
+  rm -rf "$work"
+  mkdir -p "$work/head" "$work/base/$(dirname "$PROMPT_REL")"
+  printf 'head\n' > "$work/head/README"
+  printf '%s\n' "$PROMPT_BODY" > "$work/base/${PROMPT_REL}"
+  : > "$work/output"
+  : > "$work/env"
+  (cd "$work" && PROMPT_PATH="$PROMPT_REL" REVIEW_NAME=security PR_NUMBER=7 \
+     BASE_REF=main HEAD_SHA=deadbeef REPO=dourolabs/prototypes \
+     DIFF_STATUS="$1" DIFF_BYTES=500000 DIFF_CAP_BYTES="$cap" \
+     GITHUB_OUTPUT="$work/output" GITHUB_ENV="$work/env" \
+     bash "$prompt_snippet" >/dev/null 2>&1) || true
+  cat "$work/output"
+}
+
+for status in complete truncated failed ''; do
+  label="diff status '${status}'"
+  text=$(compose_prompt "$status")
+  if [ -z "$text" ]; then
+    fail "prompt step composed nothing for ${label}"
+    continue
+  fi
+  if grep -qiE 'run builds|git -C|git diff' <<<"$text"; then
+    fail "prompt for ${label} still tells the agent to run git or builds"
+  else
+    ok "prompt for ${label} does not tell the agent to run git or builds"
+  fi
+  if grep -qF 'You have no shell. Do not try to run git, builds or tests.' <<<"$text" \
+     && grep -qF 'Everything under `./head` and `./review`' <<<"$text"; then
+    ok "prompt for ${label} says the agent has no shell and marks ./review untrusted"
+  else
+    fail "prompt for ${label} must say 'You have no shell' and name ./review as untrusted"
+  fi
+  case "$status" in
+    complete|truncated)
+      if grep -qF './review/pr.diff' <<<"$text" && grep -qF './review/files.txt' <<<"$text" \
+         && grep -qF './review/commits.txt' <<<"$text"; then
+        ok "prompt for ${label} names ./review/pr.diff, files.txt and commits.txt"
+      else
+        fail "prompt for ${label} must name ./review/pr.diff, ./review/files.txt and ./review/commits.txt"
+      fi
+      if [ "$status" = truncated ]; then
+        if grep -qF "is cut" <<<"$text" && grep -qF "first ${cap} of" <<<"$text" \
+           && grep -qF 'is complete' <<<"$text"; then
+          ok "prompt for ${label} says the diff is cut and the file list is complete"
+        else
+          fail "prompt for ${label} must say pr.diff is cut and files.txt is complete"
+        fi
+      elif grep -qF 'is cut' <<<"$text"; then
+        fail "prompt for ${label} says the diff is cut"
+      fi
+      ;;
+    *)
+      if grep -qF 'could not write the diff' <<<"$text" && ! grep -qF './review/pr.diff' <<<"$text"; then
+        ok "prompt for ${label} says the diff is missing and points at ./base and ./head"
+      else
+        fail "prompt for ${label} must say the diff could not be written, and not point at ./review/pr.diff"
+      fi
+      ;;
+  esac
 done
 
 ## 4. The verdict normalisation, extracted from the YAML and executed.
