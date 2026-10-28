@@ -149,10 +149,11 @@ verdict.
    `greenlight-review-impl.yml` and passes `ANTHROPIC_API_KEY` and
    `CLAUDE_CODE_OAUTH_TOKEN` by name under `secrets:`.
 3. The `review` job checks out the base ref and the head sha into
-   separate directories, composes the prompt from the **base** checkout,
-   runs the agent, and emits a verdict as a job output. It resolves every
-   failure it knows about into an `error` verdict rather than failing —
-   see [Why the review job stays green](#why-the-review-job-stays-green).
+   separate directories, writes the PR diff to `./review/` (see
+   [What the agent sees](#what-the-agent-sees)), composes the prompt from
+   the **base** checkout, runs the agent, and emits a verdict as a job
+   output. It resolves every failure it knows about into an `error`
+   verdict rather than failing — see [Why the review job stays green](#why-the-review-job-stays-green).
 4. The `report` job reads that output, shows the verdict on the run
    page, posts the check run, and, when `verdict_url` is set, POSTs the
    verdict to greenlight.
@@ -328,10 +329,11 @@ The reusable workflow keeps that split on disk:
 | --- | --- | --- | --- |
 | `base/` | `base_ref` | the prompt | trusted |
 | `head/` | `head_sha` | the code under review | untrusted |
+| `review/` | written from `head/` | the PR diff, file list and commits | untrusted |
 
-`prompt_path` is read from `base/`, **never** from `head/`. Nothing
-outside the agent's own sandbox reads, sources or executes anything under
-`head/`. The agent's working directory is the workspace root rather than
+`prompt_path` is read from `base/`, **never** from `head/`. Outside the
+agent's own sandbox, only the diff step reads `head/`, through git, and
+it runs nothing from it (see [What the agent sees](#what-the-agent-sees)). The agent's working directory is the workspace root rather than
 `head/`, so a PR-authored `CLAUDE.md` or `.claude/settings.json` is never
 picked up as agent configuration.
 
@@ -339,6 +341,32 @@ Editing the prompt, the caller workflow, or `.github/greenlight.yml` in a
 PR therefore changes nothing about that PR's own review. It takes effect
 once the change is on the base branch — which requires a merge, which
 requires the review.
+
+## What the agent sees
+
+The agent has no shell: it reads files with Read and Grep and runs
+nothing. It holds the agent credential and reads untrusted code, so
+running a build or a test from `head/` could leak that credential. Even
+read-only git is not allowed, because the agent can edit
+`head/.git/config`, and git runs programs named there (`core.pager`,
+`diff.external`, textconv drivers, `core.fsmonitor`).
+
+So before the agent runs, the `Write the PR diff for the agent` step
+writes the change to `review/` at the workspace root:
+
+| File | Holds |
+| --- | --- |
+| `review/files.txt` | `git diff --name-status` from the merge base with `origin/<base_ref>` to the head sha. Never cut. |
+| `review/commits.txt` | `git log --oneline` over the same range. |
+| `review/pr.diff` | The diff over the same range, cut at a line boundary once it passes 400,000 bytes (`PR_DIFF_CAP_BYTES`). |
+
+That step runs git without the system config and with the external diff,
+textconv, fsmonitor and pager switched off. The prompt tells the agent to
+read those three files first, says so when `pr.diff` is cut, and tells it
+to compare whole files between `base/` and `head/`. If the step cannot
+write the diff (no merge base, a git error), the review still runs: the
+prompt says the diff is missing and the agent compares `base/` with
+`head/`.
 
 ## Why two jobs
 
@@ -594,7 +622,8 @@ only `report` holds `id-token: write`), the agent step's
 `report` job posts, and — structurally — that no step in the `review` job
 exits non-zero, that every fallible one carries `continue-on-error: true`,
 that the agent's step cap sits under the job's cap and both under
-greenlight's dispatch timeout, and that full output stays off.
+greenlight's dispatch timeout, that full output stays off, and that the
+agent step allows no Bash tool.
 
 It then extracts the shell blocks from the shipped YAML by their
 `greenlight-*:begin`/`:end` markers and executes them, so the tests run
@@ -602,7 +631,12 @@ the code CI runs rather than a copy of it:
 
 - the credential guard against every combination of the two secrets;
 - the prompt step against each missing checkout and a missing prompt
-  file;
+  file, and for each diff status: it names `./review/pr.diff`, says when
+  the diff is cut, and never tells the agent to run git or builds;
+- the diff step on a sample repository: a small change, a change over
+  the cap (cut at a line, file list complete), a missing base branch, and
+  a `head/.git/config` that plants an external diff, textconv driver,
+  fsmonitor and pager, none of which may run;
 - the preflight check against each step outcome;
 - each guard's real diagnosis fed through the verdict normalisation,
   which must give `error` with that diagnosis as the summary;
