@@ -147,7 +147,8 @@ verdict.
    `check_name`, and from the cutover on, `verdict_url`.
 2. That thin caller passes them all to this repository's
    `greenlight-review-impl.yml` and passes `ANTHROPIC_API_KEY` and
-   `CLAUDE_CODE_OAUTH_TOKEN` by name under `secrets:`.
+   the five OAuth token slots `CLAUDE_CODE_OAUTH_TOKEN` and
+   `CLAUDE_CODE_OAUTH_TOKEN_2` to `_5` by name under `secrets:`.
 3. The `review` job checks out the base ref and the head sha into
    separate directories, writes the PR diff to `./review/` (see
    [What the agent sees](#what-the-agent-sees)), composes the prompt from
@@ -230,42 +231,54 @@ caller is written — see
 ### Set the agent credential
 
 The review agent authenticates with **either** an Anthropic API key
-**or** a Claude Code OAuth token. Set **exactly one**, **once as an
-organization-level Actions secret**, so onboarding a repository is not a
-per-repo secret-provisioning chore:
+**or** one or more Claude Code OAuth tokens. Set **the key or OAuth
+tokens, not both**, **once as organization-level Actions secrets**, so
+onboarding a repository is not a per-repo secret-provisioning chore:
 
 ```
-ANTHROPIC_API_KEY          # an Anthropic API key, or
-CLAUDE_CODE_OAUTH_TOKEN    # a Claude Code OAuth token
+ANTHROPIC_API_KEY            # an Anthropic API key, or
+CLAUDE_CODE_OAUTH_TOKEN      # OAuth token slot 1, and optionally
+CLAUDE_CODE_OAUTH_TOKEN_2    # slot 2
+CLAUDE_CODE_OAUTH_TOKEN_3    # slot 3
+CLAUDE_CODE_OAUTH_TOKEN_4    # slot 4
+CLAUDE_CODE_OAUTH_TOKEN_5    # slot 5
 ```
 
-Either one is enough and the workflow behaves identically with either.
+The key alone is enough, and so is any one OAuth slot. Set more OAuth
+slots to spread reviews across several accounts and to keep reviewing
+when one runs out of quota — see [Credential rotation](#credential-rotation).
 **Prefer the API key**: it is scoped and independently rotatable, where
-an OAuth token is account-scoped. This secret reaches the job that reads
+an OAuth token is account-scoped. These secrets reach the job that reads
 untrusted input, so the narrower credential is the better one — see the
 blast-radius note under [Why two jobs](#why-two-jobs).
 
-The caller passes both secrets by name under `secrets:`, which is what
+The caller passes all six secrets by name under `secrets:`, which is what
 carries an org-level secret into the reusable workflow. It does not use
 `secrets: inherit`, because `inherit` passes nothing when the caller and
 the reusable workflow are in different orgs or enterprises, and this
 workflow lives in `dourolabs`. An unset secret passes as an empty string,
-which the guard below treats as absent. Give whichever secret you set an
+which the guard below treats as absent. Give each secret you set an
 org-level repository-access policy that covers the repositories you
 onboard.
 
-**Exactly one, and the run says so when it is not.** `workflow_call`
-cannot express "one of these two", so neither secret is declared
+A caller that passes only `ANTHROPIC_API_KEY` and
+`CLAUDE_CODE_OAUTH_TOKEN` keeps working, on slot 1 alone. Pass the other
+slots only once the `v2` tag you call declares them: passing a secret the
+called workflow does not declare fails the run at startup.
+
+**The key or slots, not both, and the run says so when it is not.**
+`workflow_call` cannot express that rule, so no secret is declared
 `required: true`. A guard step at the top of the `review` job enforces it
 instead, before either checkout, and says so loudly rather than producing
 a silent non-verdict:
 
-- **Neither set** — the review errors, naming both secrets.
-- **Both set** — the review *also* errors. The workflow deliberately
-  does not pick between them: the action accepts both, and a silent
-  precedence this workflow does not control is what turns a credential
-  change into a long debug. Remove one secret, or narrow its org-level
-  repository-access policy so it does not reach the repository.
+- **Nothing set** — the review errors, naming every secret.
+- **The key and one or more slots set** — the review *also* errors. The
+  workflow deliberately does not pick between them: the action accepts
+  both, and a silent precedence this workflow does not control is what
+  turns a credential change into a long debug. Remove the key or the
+  slots, or narrow their org-level repository-access policy so they do
+  not reach the repository.
 
 Both land as a `greenlight/review-<name>` check run reading "Errored",
 whose summary is the sentence above, plus an `::error::` annotation on
@@ -273,12 +286,83 @@ the run. Greenlight records no decision, so once the secret is fixed, a
 re-run of the review picks it up without a new commit. The job itself
 stays green — see
 [Why the review job stays green](#why-the-review-job-stays-green).
+Otherwise the guard logs which slots are set, as numbers only:
+`OAuth slots set: 1 3 4`.
 
 That second rule is worth knowing before you switch credential types.
 Adding the new secret org-wide while the old one is still visible breaks
 every review until you remove the old one, so **remove first and add
 second**. The outcome is fail-safe — the PR stays blocked and is
 re-dispatchable — but it is not self-healing.
+
+### Credential rotation
+
+With OAuth slots, each run tries them in a random order, so no single
+token takes every review:
+
+1. A step shuffles the set slots and picks up to three: `slot_a`,
+   `slot_b`, `slot_c`.
+2. The agent runs on `slot_a`. If it fails with a **quota or auth
+   error** — a usage limit, a quota or rate limit (429), or a 401, an
+   invalid, revoked or expired token — the agent runs again on the next
+   slot, up to three attempts per run.
+3. Any other failure does not rotate: a timeout, a model error, no result
+   from the agent, no structured output. The run ends as `error`, as it
+   would with one token, so a PR that breaks the agent cannot burn every
+   token.
+
+Each rotation writes a warning to the run, with slot numbers and never a
+value:
+
+```
+review credential slot 3 hit quota (resets Nov 3, 5pm (UTC)); trying slot 1
+```
+
+The reset time is read from the error text when it carries one, and is
+`unknown` otherwise. When every attempt hits a quota or auth error, the
+review errors with "all review credentials are out of quota or rejected
+(slots 3 1 4), earliest reset <time>". With the API key there is one
+attempt and no rotation.
+
+The attempts share the agent's 14-minute budget — see
+[Timeouts](#timeouts). A later attempt runs only with at least 2 minutes
+of it left.
+
+The classifier reads the last `result` entry of the attempt's execution
+file, and rotates only when that entry has `is_error: true` and its text
+matches one of these patterns (case-insensitive extended regular
+expressions, kept in the `Check attempt N for a quota or auth error`
+steps). "CC 2.1.273" is the Claude Code version claude-code-action
+v1.0.226 installs; the strings were read from that release's binary.
+
+| Kind | Pattern | Source |
+| --- | --- | --- |
+| quota | `you.ve hit your [a-z0-9' -]*(limit\|budget)` | CC 2.1.273: "You've hit your weekly limit · resets …", also session, Opus, Sonnet, usage and spend limits, and "team's shared budget" |
+| quota | `you.re out of (usage credits\|extra usage)` | CC 2.1.273 |
+| quota | `usage limit reached` | CC 2.1.273 lists it among the Anthropic API errors it recognises. Older Claude Code wrote `Claude AI usage limit reached\|<unix seconds>`; that form is not in 2.1.273 |
+| quota | `spend limit reached` | CC 2.1.273, a gateway spend limit |
+| quota | `credit balance (is )?too low` | CC 2.1.273, an API key out of credit |
+| quota | `billing_error` | CC 2.1.273 maps this API error type to "usage limit reached" |
+| quota | `rate_limit_error` | The API's 429 error type ([API errors](https://docs.anthropic.com/en/api/errors)) |
+| quota | `request rejected \(429\)` | CC 2.1.273's text for a 429 |
+| quota | `api error: 429` | A guess, by analogy with CC's `API Error: 401` |
+| quota | `429 too many requests` | A guess |
+| auth | `invalid api key` | CC 2.1.273: "Invalid API key · Please run /login" |
+| auth | `invalid x-api-key` | The API's 401 message for a bad key |
+| auth | `invalid bearer token` | A guess, for a bad OAuth token |
+| auth | `oauth token (has )?(expired\|revoked)` | CC 2.1.273: "OAuth token revoked · Please run /login". "expired" is a guess |
+| auth | `login expired` | CC 2.1.273: "Login expired · Please run /login" |
+| auth | `failed to authenticate` | CC 2.1.273 |
+| auth | `not logged in` | CC 2.1.273 |
+| auth | `please run /login` | CC 2.1.273, the suffix of its auth errors |
+| auth | `authentication_error` | The API's 401 error type ([API errors](https://docs.anthropic.com/en/api/errors)) |
+| auth | `api error: 401` | CC 2.1.273: "API Error: 401 Invalid API key · Please run /login" |
+| auth | `401 unauthorized` | CC 2.1.273 lists it among the errors it recognises |
+
+No log of the current weekly-limit error has been captured yet. If a
+real quota error does not rotate, add its text to the list in all three
+classifier steps; `scripts/check-review-workflow.sh` fails if the three
+differ.
 
 ### Write a prompt and reference it
 
@@ -432,8 +516,8 @@ section.
 **The credential is the one secret inside the blast radius.** It reaches
 the `review` job, which is the job that reads untrusted input. An
 org-level key is a deliberate trade against per-repo provisioning toil;
-rotate it as you would any CI credential. A `CLAUDE_CODE_OAUTH_TOKEN`
-used in its place inherits exactly that exposure and is worse in kind: it
+rotate it as you would any CI credential. An OAuth token used in its
+place inherits exactly that exposure and is worse in kind: it
 is an account-scoped credential rather than a scoped, independently
 rotatable API key, so it widens what a successful injection would reach.
 
@@ -464,8 +548,9 @@ next run.
 
 | Failure | What the PR sees |
 | --- | --- |
-| Neither credential secret is visible | Errored: "The review agent has no credential…" |
-| Both credential secrets are visible | Errored: "Both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN are visible…" |
+| No credential secret is visible | Errored: "The review agent has no credential…" |
+| The API key and OAuth slots are both visible | Errored: "Both ANTHROPIC_API_KEY and OAuth slot(s) … are visible…" |
+| Every attempt hits a quota or auth error | Errored: "all review credentials are out of quota or rejected (slots …), earliest reset …" |
 | The base ref did not check out | Errored, naming the ref |
 | The head sha did not check out | Errored, naming the sha |
 | `prompt_path` is gone from the base ref | Errored, naming the file and the ref |
@@ -482,14 +567,15 @@ to tidy away:
   `::error::` is the obvious-looking shape and is exactly the regression
   this section exists to prevent.
 - **`continue-on-error: true` on every step that can fail.** The two
-  checkouts, the two guards, the preflight check and the agent. It reads
+  checkouts, the guards, the order step, the preflight check, the three
+  agent attempts and their classifiers. It reads
   like sloppiness; it is what keeps an unanticipated step failure off
   your `main`'s tip.
 - **`timeout-minutes` on the *agent step*, not only on the job.** A step
   that overruns *fails*, and a failed step is already an error. A job
   that overruns is *cancelled*, and nothing inside a cancelled job runs
-  to catch it. The step cap is 14 minutes and the job cap is 16, both
-  under greenlight's 20-minute dispatch timeout.
+  to catch it. The agent attempts share a 14-minute budget and the job
+  cap is 16, both under greenlight's 20-minute dispatch timeout.
 
 `scripts/check-review-workflow.sh` pins all three structurally, and
 executes each guard block against every case.
@@ -578,9 +664,11 @@ that produced it.
 | No workflow run at all | A `403` means the greenlight App was never re-authorized for **Actions: write** — see [Authorize the greenlight App](#authorize-the-greenlight-app). A `404` means the caller workflow is missing from your default branch or from the PR's base branch, or its filename does not match what greenlight dispatches to. |
 | Dispatch fails `422`, and the PR shows `review_dispatch_failed` | The caller is still the `v1` one and does not declare `verdict_url`. Copy the `v2` example over it — see [Moving from `v1` to `v2`](#moving-from-v1-to-v2). |
 | Run is `startup_failure` with zero jobs and no log | The caller job grants less than this workflow's jobs request. Put `permissions:` with `contents: read`, `checks: write` and `id-token: write` on the caller's `review:` job — see [Keep the `permissions:` block on the `review:` job](#keep-the-permissions-block-on-the-review-job). GitHub refuses to build the job graph before anything starts, so there is no log to open; the reason shows only in the Actions web UI. |
-| The review errors, complaining about a secret | The `Check the agent credentials` step names which case it is. Neither visible: check the org secret's repository-access policy, and that the caller still passes both secrets by name under `secrets:`. Both visible: remove one, or narrow its access policy — the workflow will not pick between them. See [Set the agent credential](#set-the-agent-credential). Once fixed, re-dispatch the review; no new commit is needed. |
+| The review errors, complaining about a secret | The `Check the agent credentials` step names which case it is. Nothing visible: check the org secrets' repository-access policy, and that the caller still passes the secrets by name under `secrets:`. Key and slots visible: remove one kind, or narrow its access policy — the workflow will not pick between them. See [Set the agent credential](#set-the-agent-credential). Once fixed, re-dispatch the review; no new commit is needed. |
+| `review credential slot N hit quota` warnings | Slot N failed on a quota or auth error and the run tried the next slot — see [Credential rotation](#credential-rotation). The review still has a verdict if a later slot worked. If every attempt hit one, the review errors with "all review credentials are out of quota or rejected"; add a slot, wait for the reset, or replace a rejected token, then re-dispatch. |
+| The agent failed on quota or auth, but the run did not rotate | Its error text matched no pattern in [Credential rotation](#credential-rotation). The "Print the agent's error" step shows the text; add a pattern for it. |
 | Run is green, check run says "Errored" with a diagnostic summary | A guard caught a known failure and turned it into an error rather than failing the job — see [Why the review job stays green](#why-the-review-job-stays-green). The summary names the cause; the `review` job log carries the matching `::error::` annotation. A missing `prompt_path` on the base ref reads this way: add the file to the base branch, or drop the review from `.github/greenlight.yml`. |
-| Check run says "Errored", summary says the agent did not finish | The agent crashed or ran past its 14-minute step cap. When the agent reported an error, the "Print the agent's error" step shows its message as an `::error::` annotation, cut to 2000 characters. The "Run the review agent" step is red inside a green job, which is what `continue-on-error` looks like. |
+| Check run says "Errored", summary says the agent did not finish | The agent crashed or ran past its time cap. When the agent reported an error, the "Print the agent's error" step shows its message as an `::error::` annotation per attempt, cut to 2000 characters. The "Run the review agent" step is red inside a green job, which is what `continue-on-error` looks like. |
 | Check run says "Errored", summary says no verdict field or an unrecognised verdict | The agent ran but did not return exactly `approve` or `reject`. The `review` job's "Normalise the verdict" step prints what it resolved. |
 | "Failed to configure git authentication" in the agent step | The "Make the workspace root a git repository" step gives the action a repository to configure, so this should not appear. If that step printed that it could not, the error is expected and does not affect the verdict. |
 | Check run says the review job produced no verdict | The `review` job itself went down — a lost runner, or a job cancelled from outside. That one also reddens the base branch's tip commit, and nothing in the workflow can prevent it. The run sends `error`, so greenlight re-runs the review. |
@@ -599,15 +687,23 @@ job's summary.
 
 ## Timeouts
 
-The agent step is capped at **14 minutes** and the `review` job at
-**16**, both comfortably under greenlight's 20-minute dispatch timeout,
-so a stuck agent resolves to an error rather than racing that timeout.
+The agent attempts share a **14-minute** budget, and the `review` job is
+capped at **16**, both comfortably under greenlight's 20-minute dispatch
+timeout, so a stuck agent resolves to an error rather than racing that
+timeout.
 
-The cap that matters is the one on the **step**. A step that overruns
+The budget starts at the order step, just before the first attempt.
+Attempt 1 is capped at 14 minutes. Attempts 2 and 3 are capped at the
+whole minutes left of the budget, and run only with at least 2 of them
+left. A quota or auth error should return within seconds, but nothing
+here relies on that: however the time splits, the attempts together stay
+inside the 14 minutes.
+
+The caps that matter are the ones on the **steps**. A step that overruns
 fails, `continue-on-error` keeps the job green, and the verdict step
 turns it into an error naming the cause. A job that overruns is
 *cancelled*, and nothing inside a cancelled job runs to catch it — so the
-job cap is a backstop two minutes above the step's, not the budget. Do
+job cap is a backstop two minutes above the budget, not the budget. Do
 not collapse the two into one.
 
 Neither is a caller input, because a repository that needs longer than 14
@@ -621,15 +717,19 @@ only `report` holds `id-token: write`), the agent step's
 `github_token` and `allowed_bots` keys, the conclusions and titles the
 `report` job posts, and — structurally — that no step in the `review` job
 exits non-zero, that every fallible one carries `continue-on-error: true`,
-that the agent's step cap sits under the job's cap and both under
-greenlight's dispatch timeout, that full output stays off, and that the
-agent step allows no Bash tool.
+that the agent budget sits under the job's cap and both under
+greenlight's dispatch timeout, that full output stays off, that no
+agent attempt allows a Bash tool, and that each attempt reads only its
+own slot's token.
 
 It then extracts the shell blocks from the shipped YAML by their
 `greenlight-*:begin`/`:end` markers and executes them, so the tests run
 the code CI runs rather than a copy of it:
 
-- the credential guard against every combination of the two secrets;
+- the credential guard against combinations of the API key and the five
+  OAuth slots;
+- the order step: it picks only set slots, each once, varies the order
+  across runs, and gives `slot_a=key` for the API key;
 - the prompt step against each missing checkout and a missing prompt
   file, and for each diff status: it names `./review/pr.diff`, says when
   the diff is cut, and never tells the agent to run git or builds;
@@ -644,7 +744,13 @@ the code CI runs rather than a copy of it:
   skipped agent step, and a summary past the old 900-character cut;
 - the agent's error against execution files with and without an
   `is_error` result, with text to escape and with text over 2000
-  characters, and that no transcript text is printed;
+  characters, for each of three attempts, and that no transcript text is
+  printed;
+- the quota/auth classifier against execution files holding a usage
+  limit with an epoch and with a "resets" time, a 401, a 429, a model
+  error, an `is_error` that is not quota or auth, and no result entry;
+  that the three copies of it are identical; and that the verdict reads
+  the attempt that ran last;
 - the git root, by running the action's own git setup commands before
   and after it;
 - the report job's verdict, annotation and job summary, including the

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify the greenlight AI review workflows without a live dispatch.
 #
-# Ten things nothing else catches:
+# Eleven things nothing else catches:
 #
 #  1. The permission split. The `review` job must not be able to post a
 #     check run or mint an OIDC token; the `report` job must be able to
@@ -15,9 +15,10 @@
 #     against greenlight's Rust source in dourolabs/prototypes; here the
 #     two published files are only checked against each other, so this
 #     repository holds no second copy of the list.
-#  3. The agent credentials. Either secret authenticates the agent, both
-#     reach the action, and the guard that enforces "exactly one" runs
-#     before the checkouts.
+#  3. The agent credentials. The API key or one or more of the five OAuth
+#     slots authenticates the agent, every one reaches the action, and the
+#     guard that enforces "the key or slots, not both" runs before the
+#     checkouts.
 #  4. The verdict normalisation. Only an exact `approve` or `reject` from
 #     an agent step that succeeded is a verdict; everything else,
 #     including every guard's diagnosis, must resolve to `error`.
@@ -52,8 +53,12 @@
 #     the file list and the commits to `./review/` before the prompt is
 #     composed. The prompt points at them and tells the agent not to run
 #     git, builds or tests, and the agent step allows no shell tool.
+# 11. Credential rotation. The order step shuffles the set slots; the
+#     agent runs up to three times, each attempt only after the one before
+#     hit a quota or auth error; the classifier rotates on those errors
+#     and nothing else; and the verdict reads the attempt that ran last.
 #
-# (3), (4) and (6) to (10) all work the same way: the shell block is lifted out
+# (3), (4) and (6) to (11) all work the same way: the shell block is lifted out
 # of the shipped YAML by its `greenlight-*:begin`/`:end` markers and run
 # here, so these test the code CI runs rather than a copy of it.
 #
@@ -88,6 +93,8 @@ guard_snippet="$scratch/guard.sh"
 prompt_snippet="$scratch/prompt.sh"
 preflight_snippet="$scratch/preflight.sh"
 verdict_snippet="$scratch/verdict.sh"
+order_snippet="$scratch/order.sh"
+rotate_snippet="$scratch/rotate.sh"
 agent_error_snippet="$scratch/agent-error.sh"
 git_root_snippet="$scratch/git-root.sh"
 review_diff_snippet="$scratch/review-diff.sh"
@@ -111,11 +118,11 @@ declared_inputs() {
 
 # Keys of the `secrets:` mapping nested one level under `on: workflow_call:`
 # — the `      NAME:` lines that follow `    secrets:`. Same shape as
-# declared_inputs, but secret names are upper case.
+# declared_inputs, but secret names are upper case and may hold digits.
 declared_secrets() {
   awk '
     /^    secrets:$/ { inside = 1; next }
-    inside && /^      [A-Z_]+:$/ { sub(/:$/, "", $1); print $1; next }
+    inside && /^      [A-Z0-9_]+:$/ { sub(/:$/, "", $1); print $1; next }
     inside && /^[^ ]/ { inside = 0 }
     inside && /^  [^ ]/ { inside = 0 }
   ' "$1" | sort
@@ -228,7 +235,11 @@ else
   ok "caller does not use 'secrets: inherit'"
 fi
 
-for name in ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN; do
+OAUTH_SLOTS=(CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN_2 CLAUDE_CODE_OAUTH_TOKEN_3
+  CLAUDE_CODE_OAUTH_TOKEN_4 CLAUDE_CODE_OAUTH_TOKEN_5)
+CREDENTIALS=(ANTHROPIC_API_KEY "${OAUTH_SLOTS[@]}")
+
+for name in "${CREDENTIALS[@]}"; do
   if grep -qxF "      ${name}: \${{ secrets.${name} }}" "$CALLER"; then
     ok "caller passes ${name} by name"
   else
@@ -275,13 +286,13 @@ fi
 review_block=$(job_block "$IMPL" review)
 report_block=$(job_block "$IMPL" report)
 
-if printf '%s\n' "$review_block" | grep -q '^      contents: read$'; then
+if grep -q '^      contents: read$' <<<"$review_block"; then
   ok "review job declares contents: read"
 else
   fail "review job must declare 'contents: read'"
 fi
 
-if printf '%s\n' "$review_block" | grep -qE '^      (checks|pull-requests|issues|actions|contents): write$'; then
+if grep -qE '^      (checks|pull-requests|issues|actions|contents): write$' <<<"$review_block"; then
   fail "review job declares a write permission; an injected agent could use it"
 else
   ok "review job declares no write permission"
@@ -290,31 +301,31 @@ fi
 # `id-token: write` is how a job mints the OIDC token Greenlight accepts
 # a verdict with. The agent reads untrusted input, so the job it runs in
 # must never hold it.
-if printf '%s\n' "$review_block" | grep -q '^ *id-token:'; then
+if grep -q '^ *id-token:' <<<"$review_block"; then
   fail "review job declares id-token; an injected agent could mint the token Greenlight accepts a verdict with"
 else
   ok "review job declares no id-token permission"
 fi
 
-if printf '%s\n' "$report_block" | grep -q '^      checks: write$'; then
+if grep -q '^      checks: write$' <<<"$report_block"; then
   ok "report job declares checks: write"
 else
   fail "report job must declare 'checks: write'"
 fi
 
-if printf '%s\n' "$report_block" | grep -q '^      id-token: write$'; then
+if grep -q '^      id-token: write$' <<<"$report_block"; then
   ok "report job declares id-token: write"
 else
   fail "report job must declare 'id-token: write': it mints the token the verdict POST carries"
 fi
 
-if printf '%s\n' "$report_block" | grep -qF "        if: \${{ inputs.verdict_url != '' }}"; then
+if grep -qF "        if: \${{ inputs.verdict_url != '' }}" <<<"$report_block"; then
   ok "verdict POST step runs only when verdict_url is set"
 else
   fail "the verdict POST step must be gated on 'if: \${{ inputs.verdict_url != '' }}', so an empty verdict_url behaves as v1 did"
 fi
 
-if printf '%s\n' "$report_block" | grep -q '^    needs: review$'; then
+if grep -q '^    needs: review$' <<<"$report_block"; then
   ok "report job needs review"
 else
   fail "report job must declare 'needs: review'"
@@ -341,19 +352,19 @@ fi
 # regression is silent everywhere else, because a `failure` reject still
 # blocks the merge in greenlight and only shows up as a red X this
 # change existed to remove.
-if printf '%s\n' "$report_block" | grep -q '^            conclusion=neutral$'; then
+if grep -q '^            conclusion=neutral$' <<<"$report_block"; then
   ok "report job posts conclusion=neutral on a reject"
 else
   fail "report job must post 'conclusion=neutral' on a reject: 'failure' reddens the PR's status roll-up and 'neutral' does not. See README.md, 'Why a reject posts neutral'"
 fi
 
-if printf '%s\n' "$report_block" | grep -q '^            conclusion=failure$'; then
+if grep -q '^            conclusion=failure$' <<<"$report_block"; then
   fail "report job posts 'conclusion=failure'; that reddens the PR's status roll-up, which is what the neutral reject exists to avoid. See README.md, 'Why a reject posts neutral'"
 else
   ok "report job never posts conclusion=failure"
 fi
 
-if printf '%s\n' "$report_block" | grep -q '^            conclusion=success$'; then
+if grep -q '^            conclusion=success$' <<<"$report_block"; then
   ok "report job posts conclusion=success on an approve"
 else
   fail "report job must post 'conclusion=success' on an approve"
@@ -362,13 +373,13 @@ fi
 # The conclusion went neutral; the title is what still tells the human
 # the review rejected, because it is what GitHub renders beside the
 # check name in the merge box.
-if printf '%s\n' "$report_block" | grep -q '^            title="Rejected"$'; then
+if grep -q '^            title="Rejected"$' <<<"$report_block"; then
   ok "report job still titles a reject \"Rejected\""
 else
   fail "report job must keep 'title=\"Rejected\"' on a reject: with the conclusion now neutral, the title is the only thing that shows the human the review rejected"
 fi
 
-if printf '%s\n' "$report_block" | grep -q '^            title="Errored"$'; then
+if grep -q '^            title="Errored"$' <<<"$report_block"; then
   ok "report job titles an error \"Errored\""
 else
   fail "report job must title an error 'title=\"Errored\"': a reject and an error both post neutral, so the title is what tells them apart"
@@ -404,20 +415,21 @@ done
 # like sloppiness, and the agent's `timeout-minutes` looks redundant
 # beside the job's.
 
-if printf '%s\n' "$review_block" | grep -qE '^ *exit [1-9]'; then
+if grep -qE '^ *exit [1-9]' <<<"$review_block"; then
   fail "the review job exits non-zero somewhere; that reddens the base branch's tip commit in every consuming repository, because this workflow is dispatched on the base ref. Record the cause in REVIEW_FATAL and 'exit 0' instead — see README.md, 'Why the review job stays green'"
 else
   ok "no step in the review job exits non-zero"
 fi
 
 # Every step that can fail on its own: the two guards that run a script,
-# the two checkouts, the diff step, the preflight check, the git root,
-# the agent and the step that prints the agent's error.
-continue_on_error=$(printf '%s\n' "$review_block" | grep -c '^        continue-on-error: true$' || true)
-if [ "$continue_on_error" -ge 9 ]; then
+# the two checkouts, the diff step, the order step, the preflight check,
+# the git root, the three agent attempts, the three classifiers and the
+# step that prints the agent's error.
+continue_on_error=$(grep -c '^        continue-on-error: true$' <<<"$review_block" || true)
+if [ "$continue_on_error" -ge 15 ]; then
   ok "every fallible step in the review job carries continue-on-error (${continue_on_error})"
 else
-  fail "only ${continue_on_error} step(s) in the review job carry 'continue-on-error: true', expected at least 9: the credential guard, both checkouts, the diff step, the prompt step, the preflight check, the git root, the agent and the agent's error. Without it a failing step fails the job, which reddens the base branch's tip commit"
+  fail "only ${continue_on_error} step(s) in the review job carry 'continue-on-error: true', expected at least 15: the credential guard, both checkouts, the diff step, the prompt step, the order step, the preflight check, the git root, the three agent attempts, the three classifiers and the agent's error. Without it a failing step fails the job, which reddens the base branch's tip commit"
 fi
 
 # Full output prints every tool result, and those can hold secrets. The
@@ -437,67 +449,95 @@ else
   fail "the 'Make the workspace root a git repository' step must come before the agent step"
 fi
 
-# The agent's cap has to be a *step* timeout. A step that overruns fails,
-# and a failed step is already a reject; a job that overruns is cancelled
+# The block of one step in the review job, from its `- name:` line to the
+# next step.
+step_block() {
+  printf '%s\n' "$review_block" | awk -v name="      - name: $1" '
+    $0 == name { inside = 1; print; next }
+    inside && /^      - name: / { inside = 0 }
+    inside && /^      # / { inside = 0 }
+    inside { print }
+  '
+}
+
+ATTEMPTS=('Run the review agent' 'Run the review agent (attempt 2)' 'Run the review agent (attempt 3)')
+
+# The agent's caps have to be *step* timeouts. A step that overruns fails,
+# and a failed step is already an error; a job that overruns is cancelled
 # and cannot be caught from inside the job.
-agent_block=$(printf '%s\n' "$review_block" | awk '
-  /^      - name: Run the review agent$/ { inside = 1 }
-  inside && /^      - name: / && ++seen > 1 { inside = 0 }
-  inside { print }
-')
+for attempt in "${ATTEMPTS[@]}"; do
+  block=$(step_block "$attempt")
+  if [ -z "$block" ]; then
+    fail "the review job has no '${attempt}' step"
+    continue
+  fi
 
-if printf '%s\n' "$agent_block" | grep -qE '^        timeout-minutes: [0-9]+$'; then
-  ok "the agent step carries its own timeout-minutes"
-else
-  fail "the agent step must carry its own 'timeout-minutes': the job-level cap cancels the job, and a cancelled job cannot turn itself into a reject"
-fi
+  if printf '%s\n' "$block" | grep -qE '^        timeout-minutes: '; then
+    ok "'${attempt}' carries its own timeout-minutes"
+  else
+    fail "'${attempt}' must carry its own 'timeout-minutes': the job-level cap cancels the job, and a cancelled job cannot turn itself into an error"
+  fi
 
-if printf '%s\n' "$agent_block" | grep -q '^        continue-on-error: true$'; then
-  ok "the agent step carries continue-on-error"
-else
-  fail "the agent step must carry 'continue-on-error: true'; an agent that crashes or overruns would otherwise fail the job and redden the base branch's tip commit"
-fi
+  if printf '%s\n' "$block" | grep -q '^        continue-on-error: true$'; then
+    ok "'${attempt}' carries continue-on-error"
+  else
+    fail "'${attempt}' must carry 'continue-on-error: true'; an agent that crashes or overruns would otherwise fail the job and redden the base branch's tip commit"
+  fi
 
-# No shell for the agent. It holds the agent credential and reads
-# untrusted code, and it can edit `head/.git/config`, so even read-only
-# git could run a program through `core.pager`, `diff.external`, a
-# textconv driver or `core.fsmonitor`. The diff step writes the diff
-# instead. Comments are skipped so the reason can be written down.
-agent_code=$(printf '%s\n' "$agent_block" | grep -v '^ *#' || true)
-if printf '%s\n' "$agent_code" | grep -q 'Bash'; then
-  fail "the agent step names a Bash tool (in --allowedTools, --allowed-tools or elsewhere); the agent gets no shell, and ./review holds the diff instead"
-else
-  ok "the agent step allows no Bash tool"
-fi
+  # No shell for the agent. It holds the agent credential and reads
+  # untrusted code, and it can edit `head/.git/config`, so even read-only
+  # git could run a program through `core.pager`, `diff.external`, a
+  # textconv driver or `core.fsmonitor`. The diff step writes the diff
+  # instead. Comments are skipped so the reason can be written down.
+  code=$(printf '%s\n' "$block" | grep -v '^ *#' || true)
+  if printf '%s\n' "$code" | grep -q 'Bash'; then
+    fail "'${attempt}' names a Bash tool (in --allowedTools, --allowed-tools or elsewhere); the agent gets no shell, and ./review holds the diff instead"
+  else
+    ok "'${attempt}' allows no Bash tool"
+  fi
+done
 
-# The step cap has to leave the job cap room to run the verdict step, and
-# both have to stay under greenlight's 20-minute dispatch timeout.
+agent_block=$(step_block 'Run the review agent')
+
+# One time budget for every attempt. Attempt 1's cap equals the budget the
+# order step starts, attempts 2 and 3 take what the classifier says is
+# left of it, and the job cap sits above the budget and under greenlight's
+# 20-minute dispatch timeout.
 agent_timeout=$(printf '%s\n' "$agent_block" | sed -n 's/^        timeout-minutes: \([0-9]*\)$/\1/p' | head -1)
 job_timeout=$(printf '%s\n' "$review_block" | sed -n 's/^    timeout-minutes: \([0-9]*\)$/\1/p' | head -1)
-if [ -n "$agent_timeout" ] && [ -n "$job_timeout" ] \
+budget=$(extract_run_block "$IMPL" greenlight-credential-order | sed -n 's/^AGENT_BUDGET_MINUTES=\([0-9]*\)$/\1/p' | head -1)
+if [ -n "$agent_timeout" ] && [ -n "$job_timeout" ] && [ "$agent_timeout" = "${budget:-}" ] \
    && [ "$agent_timeout" -lt "$job_timeout" ] && [ "$job_timeout" -lt 20 ]; then
-  ok "agent cap (${agent_timeout}m) < review job cap (${job_timeout}m) < greenlight's 20m dispatch timeout"
+  ok "agent budget (${budget}m) = attempt 1's cap < review job cap (${job_timeout}m) < greenlight's 20m dispatch timeout"
 else
-  fail "the agent step's timeout (${agent_timeout:-none}) must be under the review job's (${job_timeout:-none}), which must be under greenlight's 20-minute dispatch timeout"
+  fail "attempt 1's timeout (${agent_timeout:-none}) must equal AGENT_BUDGET_MINUTES in the order step (${budget:-none}) and be under the review job's (${job_timeout:-none}), which must be under greenlight's 20-minute dispatch timeout"
 fi
+
+for n in 2 3; do
+  want="        timeout-minutes: \${{ fromJSON(steps.rotate_$((n - 1)).outputs.minutes_left || '2') }}"
+  if step_block "Run the review agent (attempt ${n})" | grep -qxF "$want"; then
+    ok "attempt ${n}'s cap is what is left of the shared budget"
+  else
+    fail "attempt ${n} must carry '${want# *}', so the attempts together stay inside the shared budget"
+  fi
+done
 
 # `report` must run even when `review` did not succeed. `needs:` alone
 # skips it, and a skipped report posts nothing at all — the PR then waits
 # out greenlight's dispatch timeout with no reason to read.
-if printf '%s\n' "$report_block" | grep -qF '!cancelled()'; then
+if grep -qF '!cancelled()' <<<"$report_block"; then
   ok "report job runs even when review did not succeed"
 else
   fail "report job must declare 'if: \${{ !cancelled() }}': with a bare 'needs: review' a review job that goes down skips report entirely and nothing is posted"
 fi
 
-## 3. The agent credentials — either secret works, exactly one at a time.
+## 3. The agent credentials — the API key or OAuth slots, not both.
 
-CREDENTIALS=(ANTHROPIC_API_KEY CLAUDE_CODE_OAUTH_TOKEN)
 EXPECTED_SECRETS=$(printf '%s\n' "${CREDENTIALS[@]}" | sort)
 
 got_secrets=$(declared_secrets "$IMPL")
 if [ "$got_secrets" = "$EXPECTED_SECRETS" ]; then
-  ok "impl declares exactly the two credential secrets"
+  ok "impl declares exactly the six credential secrets"
 else
   fail "impl secret names differ from the contract:
 $(diff <(echo "$EXPECTED_SECRETS") <(echo "$got_secrets") || true)"
@@ -511,27 +551,66 @@ if awk '
   inside && /^        required: true$/ { found = 1 }
   END { exit !found }
 ' "$IMPL"; then
-  fail "impl marks a credential secret 'required: true'; that locks out the other one"
+  fail "impl marks a credential secret 'required: true'; that locks out the others"
 else
-  ok "impl marks neither credential secret required"
+  ok "impl marks no credential secret required"
 fi
 
-# Both reach the action. An unset secret renders empty and the action
-# treats empty as absent, so this is unconditional on purpose — see the
-# comment on the step.
-for name in "${CREDENTIALS[@]}"; do
-  input=$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')
-  if printf '%s\n' "$review_block" | grep -qF "          ${input}: \${{ secrets.${name} }}"; then
-    ok "agent step is passed ${name}"
+# Every attempt is passed the API key, and the token of its own slot,
+# looked up by number from every one of the five slots. An unset secret
+# renders empty and the action treats empty as absent, so the key is
+# passed unconditionally — see the comment on the step.
+slot_letters=(a b c)
+for i in 0 1 2; do
+  attempt=${ATTEMPTS[$i]}
+  slot="slot_${slot_letters[$i]}"
+  block=$(step_block "$attempt")
+  if grep -qxF '          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}' <<<"$block"; then
+    ok "'${attempt}' is passed ANTHROPIC_API_KEY"
   else
-    fail "agent step must pass '${input}: \${{ secrets.${name} }}'"
+    fail "'${attempt}' must pass 'anthropic_api_key: \${{ secrets.ANTHROPIC_API_KEY }}'"
+  fi
+  n=1
+  for name in "${OAUTH_SLOTS[@]}"; do
+    if grep -qE "^ +(\|\| )?steps\.order\.outputs\.${slot} == '${n}' && secrets\.${name}\$" <<<"$block"; then
+      ok "'${attempt}' passes ${name} when ${slot} is ${n}"
+    else
+      fail "'${attempt}' must pass ${name} as its claude_code_oauth_token when steps.order.outputs.${slot} is '${n}'"
+    fi
+    n=$((n + 1))
+  done
+  # Only this attempt's slot: a stray `slot_a` in attempt 2 would retry
+  # the token that just failed.
+  others=$(grep -oE 'steps\.order\.outputs\.slot_[a-z]' <<<"$block" | sort -u)
+  if [ "$others" = "steps.order.outputs.${slot}" ]; then
+    ok "'${attempt}' reads only ${slot}"
+  else
+    fail "'${attempt}' reads slots other than ${slot}: ${others//$'\n'/ }"
+  fi
+done
+
+# The three attempts are one step written three times. Their `with:`
+# blocks, comments aside, differ only in the slot they read.
+with_of() {
+  step_block "$1" | awk '
+    /^        with:$/ { inside = 1 }
+    inside { print }
+  ' | grep -v '^ *#' | sed -E 's/steps\.order\.outputs\.slot_[a-c]/SLOT/g'
+}
+with_1=$(with_of "${ATTEMPTS[0]}")
+for i in 1 2; do
+  if [ -n "$with_1" ] && [ "$(with_of "${ATTEMPTS[$i]}")" = "$with_1" ]; then
+    ok "'${ATTEMPTS[$i]}' passes the same with: block as attempt 1, on its own slot"
+  else
+    fail "'${ATTEMPTS[$i]}' must pass the same with: block as attempt 1 apart from the slot:
+$(diff <(echo "$with_1") <(with_of "${ATTEMPTS[$i]}") || true)"
   fi
 done
 
 # The guard has to run before the checkouts: a credential mistake should
 # cost zero clones.
-guard_line=$(printf '%s\n' "$review_block" | grep -n 'greenlight-credential-guard:end' | head -1 | cut -d: -f1)
-checkout_line=$(printf '%s\n' "$review_block" | grep -n 'uses: actions/checkout' | head -1 | cut -d: -f1)
+guard_line=$(grep -n 'greenlight-credential-guard:end' <<<"$review_block" | head -1 | cut -d: -f1)
+checkout_line=$(grep -n 'uses: actions/checkout' <<<"$review_block" | head -1 | cut -d: -f1)
 if [ -n "$guard_line" ] && [ -n "$checkout_line" ] && [ "$guard_line" -lt "$checkout_line" ]; then
   ok "credential guard runs before the first checkout"
 else
@@ -547,34 +626,49 @@ fi
 
 # An unset secret arrives as the empty string, so "absent" is tested as
 # empty rather than unset. The values are sentinels: the guard must name
-# the secrets and never print one.
+# the secrets and slot numbers and never print a value.
 SENTINEL_KEY='sk-ant-SENTINELKEY'
-SENTINEL_TOKEN='sk-ant-oat-SENTINELTOKEN'
+sentinel_token() { printf 'sk-ant-oat-SENTINELTOKEN%s' "$1"; }
 
-# api key | oauth token | admits? | case label
+# api key? | OAuth slots set | expected `slots` output, blank for a REVIEW_FATAL | case label
 #
-# The two bad combinations used to `exit 1`. They now exit 0 and record
-# the cause in REVIEW_FATAL instead, because a failed step fails the job
-# and the job's check run sits on the base branch's tip commit in the
+# The bad combinations used to `exit 1`. They now exit 0 and record the
+# cause in REVIEW_FATAL instead, because a failed step fails the job and
+# the job's check run sits on the base branch's tip commit in the
 # consuming repository. The diagnostic the old exit bought — an
-# `::error::` naming both secrets and pointing at the README — is still
-# asserted, and the REVIEW_FATAL line is what turns the mistake into a
-# rejecting check run on the PR.
+# `::error::` naming every secret and pointing at the README — is still
+# asserted, and the REVIEW_FATAL line is what turns the mistake into an
+# errored check run on the PR.
 credential_cases=(
   "|||neither credential set"
-  "${SENTINEL_KEY}||yes|only the API key"
-  "|${SENTINEL_TOKEN}|yes|only the OAuth token"
-  "${SENTINEL_KEY}|${SENTINEL_TOKEN}||both credentials set"
+  "|1|1|only OAuth slot 1"
+  "|2 4|2 4|OAuth slots 2 and 4"
+  "|1 2 3 4 5|1 2 3 4 5|all five OAuth slots"
+  "yes||key|only the API key"
+  "yes|3||the API key and slot 3"
+  "yes|1||the API key and slot 1"
 )
 
 for case in "${credential_cases[@]}"; do
-  IFS='|' read -r key token admits label <<<"$case"
+  IFS='|' read -r key slots want label <<<"$case"
 
   env_file="$scratch/guard-env"
+  out_file="$scratch/guard-out"
   : > "$env_file"
+  : > "$out_file"
 
-  if out=$(ANTHROPIC_API_KEY="$key" CLAUDE_CODE_OAUTH_TOKEN="$token" \
-      GITHUB_ENV="$env_file" bash "$guard_snippet" 2>&1); then
+  guard_env=(ANTHROPIC_API_KEY="${key:+$SENTINEL_KEY}")
+  for n in 1 2 3 4 5; do
+    if [ "$n" = 1 ]; then name=CLAUDE_CODE_OAUTH_TOKEN; else name="CLAUDE_CODE_OAUTH_TOKEN_${n}"; fi
+    if [[ " ${slots} " == *" ${n} "* ]]; then
+      guard_env+=("${name}=$(sentinel_token "$n")")
+    else
+      guard_env+=("${name}=")
+    fi
+  done
+
+  if out=$(env "${guard_env[@]}" GITHUB_ENV="$env_file" GITHUB_OUTPUT="$out_file" \
+      bash "$guard_snippet" 2>&1); then
     status=0
   else
     status=1
@@ -589,11 +683,24 @@ for case in "${credential_cases[@]}"; do
 
   fatal_lines=$(grep -c '^REVIEW_FATAL=' "$env_file" || true)
 
-  if [ -n "$admits" ]; then
+  if [ -n "$want" ]; then
     if [ "$fatal_lines" -eq 0 ]; then
       ok "guard admits ${label}"
     else
       fail "guard recorded a REVIEW_FATAL for ${label}; it must admit it"
+    fi
+    got=$(sed -n 's/^slots=//p' "$out_file")
+    if [ "$got" = "$want" ] && [ "$(wc -l <"$out_file")" -eq 1 ]; then
+      ok "guard outputs slots=${want} for ${label}"
+    else
+      fail "guard output '$(cat "$out_file")' for ${label}, expected 'slots=${want}'"
+    fi
+    if [ "$want" != key ]; then
+      if grep -qxF "OAuth slots set: ${want}" <<<"$out"; then
+        ok "guard logs the slot numbers for ${label}"
+      else
+        fail "guard must log 'OAuth slots set: ${want}' for ${label}: ${out}"
+      fi
     fi
   else
     if [ "$fatal_lines" -eq 1 ]; then
@@ -609,6 +716,9 @@ for case in "${credential_cases[@]}"; do
     if [ "$(wc -l <"$env_file")" -ne 1 ]; then
       fail "guard wrote more than one line to \$GITHUB_ENV for ${label}"
     fi
+    if [ -s "$out_file" ]; then
+      fail "guard wrote a slots output for ${label}, which it rejects"
+    fi
 
     fatal=$(sed -n 's/^REVIEW_FATAL=//p' "$env_file")
     fatal_gives_error "$fatal" "the credential guard's ${label}"
@@ -619,10 +729,10 @@ for case in "${credential_cases[@]}"; do
       fail "guard did not annotate ${label} with an ::error::"
     fi
     for name in "${CREDENTIALS[@]}"; do
-      if ! printf '%s' "$out" | grep -qF "$name"; then
+      if ! printf '%s' "$out" | grep -qwF "$name"; then
         fail "guard's error for ${label} does not name ${name}"
       fi
-      if ! printf '%s' "$fatal" | grep -qF "$name"; then
+      if ! printf '%s' "$fatal" | grep -qwF "$name"; then
         fail "guard's REVIEW_FATAL for ${label} does not name ${name}"
       fi
     done
@@ -638,12 +748,12 @@ for case in "${credential_cases[@]}"; do
   fi
 
   # Whatever it printed or recorded, it must not carry a credential.
-  for value in "$SENTINEL_KEY" "$SENTINEL_TOKEN"; do
+  for value in "$SENTINEL_KEY" "$(sentinel_token '')"; do
     if printf '%s' "$out" | grep -qF "$value"; then
       fail "guard echoed a credential value for ${label}"
     fi
-    if grep -qF "$value" "$env_file"; then
-      fail "guard recorded a credential value in REVIEW_FATAL for ${label}"
+    if grep -qF "$value" "$env_file" "$out_file"; then
+      fail "guard recorded a credential value for ${label}"
     fi
   done
 done
@@ -798,23 +908,25 @@ if [ ! -s "$preflight_snippet" ]; then
   exit 1
 fi
 
-# creds outcome | prompt outcome | REVIEW_FATAL already set | expect a REVIEW_FATAL written | case label
+# creds outcome | prompt outcome | order outcome | REVIEW_FATAL already set | expect a REVIEW_FATAL written | case label
 #
 # An empty outcome counts as a failure: the `if:` expressions always
 # populate these in CI, so an empty one means something the workflow does
 # not model, and a reject is the fail-safe reading of that.
 preflight_cases=(
-  "success|success|||both steps succeeded"
-  "failure|skipped||yes|the credential guard died unexpectedly"
-  "success|failure||yes|the prompt step died unexpectedly"
-  "success|cancelled||yes|the prompt step was cancelled"
-  "|||yes|no outcomes at all"
-  "failure|skipped|Already diagnosed.||an earlier guard already recorded a cause"
-  "success|success|Already diagnosed.||a recorded cause with everything green"
+  "success|success|success|||every step succeeded"
+  "failure|skipped|skipped||yes|the credential guard died unexpectedly"
+  "success|failure|skipped||yes|the prompt step died unexpectedly"
+  "success|cancelled|skipped||yes|the prompt step was cancelled"
+  "success|success|failure||yes|the order step died unexpectedly"
+  "success|success|skipped||yes|the order step was skipped with no cause recorded"
+  "||||yes|no outcomes at all"
+  "failure|skipped|skipped|Already diagnosed.||an earlier guard already recorded a cause"
+  "success|success|success|Already diagnosed.||a recorded cause with everything green"
 )
 
 for case in "${preflight_cases[@]}"; do
-  IFS='|' read -r creds prompt preset expect_write label <<<"$case"
+  IFS='|' read -r creds prompt order preset expect_write label <<<"$case"
 
   env_file="$scratch/preflight-env"
   : > "$env_file"
@@ -822,9 +934,9 @@ for case in "${preflight_cases[@]}"; do
   run_preflight() {
     if [ -n "$preset" ]; then
       REVIEW_FATAL="$preset" CREDS_OUTCOME="$creds" PROMPT_OUTCOME="$prompt" \
-        GITHUB_ENV="$env_file" bash "$preflight_snippet" 2>&1
+        ORDER_OUTCOME="$order" GITHUB_ENV="$env_file" bash "$preflight_snippet" 2>&1
     else
-      CREDS_OUTCOME="$creds" PROMPT_OUTCOME="$prompt" \
+      CREDS_OUTCOME="$creds" PROMPT_OUTCOME="$prompt" ORDER_OUTCOME="$order" \
         GITHUB_ENV="$env_file" bash "$preflight_snippet" 2>&1
     fi
   }
@@ -862,7 +974,133 @@ for case in "${preflight_cases[@]}"; do
   fi
 done
 
-## 3e. The PR diff, extracted from the YAML and executed.
+## 3e. The credential order, extracted from the YAML and executed.
+
+# It shuffles the set slots and writes the first three as slot_a, slot_b
+# and slot_c — slot numbers only, never a token — plus the deadline of the
+# agents' shared budget. With the API key, slot_a is `key` and nothing
+# follows it.
+
+extract_run_block "$IMPL" greenlight-credential-order > "$order_snippet"
+
+if [ ! -s "$order_snippet" ]; then
+  fail "could not extract the credential-order block from $IMPL"
+  exit 1
+fi
+
+# The order step runs after the credential guard and before the preflight
+# check, which reads its outcome.
+order_line=$(grep -n -- '- name: Pick the credential order$' "$IMPL" | head -1 | cut -d: -f1)
+preflight_line=$(grep -n -- '- name: Check the steps before the agent$' "$IMPL" | head -1 | cut -d: -f1)
+creds_line=$(grep -n -- '- name: Check the agent credentials$' "$IMPL" | head -1 | cut -d: -f1)
+if [ -n "$order_line" ] && [ -n "$preflight_line" ] && [ -n "$creds_line" ] \
+   && [ "$creds_line" -lt "$order_line" ] && [ "$order_line" -lt "$preflight_line" ]; then
+  ok "the order step runs after the credential guard and before the preflight check"
+else
+  fail "'Pick the credential order' must come after 'Check the agent credentials' and before 'Check the steps before the agent'"
+fi
+
+if grep -q 'secrets\.' <<<"$(step_block 'Pick the credential order')"; then
+  fail "the order step reads a secret; it needs only the slot numbers the credential guard outputs"
+else
+  ok "the order step reads no secret"
+fi
+
+run_order() {
+  local slots=$1
+  order_out="$scratch/order-out"
+  order_env="$scratch/order-env"
+  : > "$order_out"
+  : > "$order_env"
+  SLOTS="$slots" GITHUB_OUTPUT="$order_out" GITHUB_ENV="$order_env" \
+    bash "$order_snippet" >/dev/null 2>&1
+}
+order_output() { sed -n "s/^$1=//p" "$order_out"; }
+
+# slots in | case label
+for case in "1|one slot" "2 4|two slots" "1 3 5|three slots" "1 2 3 4 5|five slots"; do
+  IFS='|' read -r slots label <<<"$case"
+  seen=''
+  for _ in $(seq 1 40); do
+    if ! run_order "$slots"; then
+      fail "order step exited non-zero for ${label}"
+      break
+    fi
+    picked=$(printf '%s\n' "$(order_output slot_a)" "$(order_output slot_b)" "$(order_output slot_c)" | sed '/^$/d')
+    want_count=$(wc -w <<<"$slots")
+    [ "$want_count" -gt 3 ] && want_count=3
+    # Each picked slot is a set slot, picked once, and as many as there
+    # are slots, up to three.
+    if [ "$(wc -l <<<"$picked")" -ne "$want_count" ] \
+       || [ "$(sort -u <<<"$picked" | wc -l)" -ne "$want_count" ]; then
+      fail "order step picked '${picked//$'\n'/ }' for ${label}, expected ${want_count} distinct slots"
+      break
+    fi
+    while read -r p; do
+      if [[ " ${slots} " != *" ${p} "* ]]; then
+        fail "order step picked slot ${p}, which is not set, for ${label}"
+      fi
+    done <<<"$picked"
+    if [ -s "$order_env" ]; then
+      fail "order step recorded a REVIEW_FATAL for ${label}: $(cat "$order_env")"
+    fi
+    seen="${seen}${picked//$'\n'/ }"$'\n'
+  done
+  distinct=$(sed '/^$/d' <<<"$seen" | sort -u | wc -l)
+  if [ "$(wc -w <<<"$slots")" -eq 1 ]; then
+    [ "$distinct" -eq 1 ] && ok "order step always picks the one slot for ${label}"
+  elif [ "$distinct" -gt 1 ]; then
+    ok "order step varies the order across runs for ${label} (${distinct} distinct orders in 40 runs)"
+  else
+    fail "order step gave the same order in 40 runs for ${label}: it does not shuffle"
+  fi
+  # A fifth slot is reachable as slot_a: with five set, every slot must
+  # come first in some run.
+  if [ "$label" = "five slots" ]; then
+    firsts=$(sed '/^$/d' <<<"$seen" | cut -d' ' -f1 | sort -u | tr '\n' ' ')
+    if [ "$firsts" = "1 2 3 4 5 " ]; then
+      ok "order step puts every one of five slots first in some run"
+    else
+      fail "order step put only slots ${firsts}first in 40 runs of five slots"
+    fi
+  fi
+done
+
+if run_order key && [ "$(order_output slot_a)" = key ] && [ -z "$(order_output slot_b)" ] \
+   && [ -z "$(order_output slot_c)" ] && [ ! -s "$order_env" ]; then
+  ok "order step gives slot_a=key and no later slot for the API key"
+else
+  fail "order step for the API key wrote: $(cat "$order_out")"
+fi
+
+budget_seconds=$(( ${budget:-14} * 60 ))
+now=$(date +%s)
+run_order "1 2" || true
+deadline=$(order_output deadline)
+if [[ "$deadline" =~ ^[0-9]+$ ]] && [ "$deadline" -ge $((now + budget_seconds - 5)) ] \
+   && [ "$deadline" -le $((now + budget_seconds + 5)) ]; then
+  ok "order step sets the deadline ${budget:-14} minutes out"
+else
+  fail "order step set deadline '${deadline}', expected about $((now + budget_seconds))"
+fi
+
+for case in "|no slots" "1 9|an unknown slot" "1 x|a slot name that is not a number"; do
+  IFS='|' read -r slots label <<<"$case"
+  if run_order "$slots"; then
+    ok "order step exits 0 for ${label}"
+  else
+    fail "order step exited non-zero for ${label}"
+  fi
+  if [ "$(grep -c '^REVIEW_FATAL=' "$order_env")" -eq 1 ] && [ "$(wc -l <"$order_env")" -eq 1 ] \
+     && [ ! -s "$order_out" ]; then
+    ok "order step records one REVIEW_FATAL and picks nothing for ${label}"
+    fatal_gives_error "$(sed -n 's/^REVIEW_FATAL=//p' "$order_env")" "the order step's ${label}"
+  else
+    fail "order step for ${label}: env '$(cat "$order_env")', output '$(cat "$order_out")'"
+  fi
+done
+
+## 3f. The PR diff, extracted from the YAML and executed.
 
 # The agent cannot run git, so the diff step writes the change to
 # `./review/` and the prompt step points at it. The diff step runs
@@ -1206,6 +1444,45 @@ else
   fail "verdict block changed a ${#long_multibyte}-character summary: $(sed -n 's/^summary=//p' "$out" | head -c 80)…"
 fi
 
+# More than one attempt. The verdict comes from the attempt that ran
+# last; when that one rotated too, every attempt did, and the summary
+# names the slots tried and the earliest reset.
+#
+# expected verdict | expected summary prefix | case label | the verdict
+# step's env, as NAME=value pairs separated by `;`
+epoch_early=$(date -u -d @1761955200 '+%Y-%m-%d %H:%M UTC')
+epoch_late=$(date -u -d @1762041600 '+%Y-%m-%d %H:%M UTC')
+multi_cases=(
+  "approve|Fine on slot 2.|a verdict from attempt 2 after attempt 1 rotated|AGENT_OUTCOME=failure;AGENT_CONCLUSION=failure;ROTATE_1=true;SLOT_1=3;SLOT_2=2;AGENT_OUTCOME_2=success;AGENT_CONCLUSION_2=success;STRUCTURED_OUTPUT_2={\"verdict\":\"approve\",\"summary\":\"Fine on slot 2.\"};ROTATE_2=false;AGENT_OUTCOME_3=skipped"
+  "reject|Bad on slot 5.|a verdict from attempt 3|AGENT_OUTCOME=failure;ROTATE_1=true;AGENT_OUTCOME_2=failure;ROTATE_2=true;AGENT_OUTCOME_3=success;AGENT_CONCLUSION_3=success;STRUCTURED_OUTPUT_3={\"verdict\":\"reject\",\"summary\":\"Bad on slot 5.\"};ROTATE_3=false"
+  "error|The review agent did not finish (step outcome: failure|attempt 2 failing on something else after attempt 1 rotated|AGENT_OUTCOME=failure;ROTATE_1=true;AGENT_OUTCOME_2=failure;AGENT_CONCLUSION_2=failure;ROTATE_2=false;AGENT_OUTCOME_3=skipped"
+  "error|The review agent did not finish (step outcome: failure|attempt 1 failing on something else, with a stale approve from no attempt 2|AGENT_OUTCOME=failure;AGENT_CONCLUSION=failure;ROTATE_1=false;AGENT_OUTCOME_2=skipped;STRUCTURED_OUTPUT_2={\"verdict\":\"approve\"}"
+  "error|all review credentials are out of quota or rejected (slots 3 1 4), earliest reset ${epoch_early}|three attempts, all rotated, epoch resets|AGENT_OUTCOME=failure;ROTATE_1=true;SLOT_1=3;RESETS_1=${epoch_late};RESETS_EPOCH_1=1762041600;AGENT_OUTCOME_2=failure;ROTATE_2=true;SLOT_2=1;RESETS_2=unknown;AGENT_OUTCOME_3=failure;ROTATE_3=true;SLOT_3=4;RESETS_3=${epoch_early};RESETS_EPOCH_3=1761955200"
+  "error|all review credentials are out of quota or rejected (slots 2 5), earliest reset Nov 3, 5pm|two slots set, both rotated, text resets|AGENT_OUTCOME=failure;ROTATE_1=true;SLOT_1=2;RESETS_1=unknown;AGENT_OUTCOME_2=failure;ROTATE_2=true;SLOT_2=5;RESETS_2=Nov 3, 5pm;AGENT_OUTCOME_3=skipped"
+  "error|all review credentials are out of quota or rejected (slots 1), earliest reset unknown|one slot set, rotated, no reset time|AGENT_OUTCOME=failure;ROTATE_1=true;SLOT_1=1;RESETS_1=unknown;AGENT_OUTCOME_2=skipped;AGENT_OUTCOME_3=skipped"
+  "error|The review credential ANTHROPIC_API_KEY is out of quota or rejected, reset 5pm.|the API key out of quota|AGENT_OUTCOME=failure;ROTATE_1=true;SLOT_1=key;RESETS_1=5pm"
+  "error|No credential was set.|a guard-recorded failure, which beats a rotation|REVIEW_FATAL=No credential was set.;AGENT_OUTCOME=skipped;ROTATE_1=true"
+)
+
+for case in "${multi_cases[@]}"; do
+  IFS='|' read -r expected want_summary label pairs <<<"$case"
+  IFS=';' read -r -a env_args <<<"$pairs"
+
+  out="$scratch/multi-normalise"
+  : > "$out"
+  if ! env -u REVIEW_FATAL "${env_args[@]}" GITHUB_OUTPUT="$out" bash "$verdict_snippet" >/dev/null 2>&1; then
+    fail "verdict block exited non-zero on ${label}"
+    continue
+  fi
+  got=$(sed -n 's/^verdict=//p' "$out")
+  got_summary=$(sed -n 's/^summary=//p' "$out")
+  if [ "$got" = "$expected" ] && [[ "$got_summary" == "$want_summary"* ]]; then
+    ok "verdict is ${expected} for ${label}"
+  else
+    fail "verdict is '${got}' with summary '${got_summary}', expected '${expected}' starting '${want_summary}', for ${label}"
+  fi
+done
+
 ## 4b. The agent's error, extracted from the YAML and executed.
 
 # The execution file is the action's JSON array of messages. Only the
@@ -1258,7 +1535,7 @@ for case in "${agent_error_cases[@]}"; do
   IFS='|' read -r file expect_error want label <<<"$case"
   if [ "$file" = MISSING ]; then path="$exec_dir/missing.json"; else path="$exec_dir/$file"; fi
 
-  if out=$(EXECUTION_FILE="$path" bash "$agent_error_snippet" 2>&1); then
+  if out=$(EXECUTION_FILE="$path" SLOT_1=3 bash "$agent_error_snippet" 2>&1); then
     ok "agent-error step exits 0 for ${label}"
   else
     fail "agent-error step exited non-zero for ${label}: ${out}"
@@ -1266,7 +1543,7 @@ for case in "${agent_error_cases[@]}"; do
 
   error_lines=$(grep -c '^::error::' <<<"$out" || true)
   if [ -n "$expect_error" ]; then
-    got=$(sed -n 's/^::error::The review agent reported an error: //p' <<<"$out")
+    got=$(sed -n 's/^::error::The review agent reported an error (attempt 1, slot 3): //p' <<<"$out")
     if [ "$error_lines" -eq 1 ] && [ "$(wc -l <<<"$out")" -eq 1 ] && [ "$got" = "$want" ]; then
       ok "agent-error step prints one ::error:: with the result text for ${label}"
     else
@@ -1283,7 +1560,208 @@ for case in "${agent_error_cases[@]}"; do
   fi
 done
 
-## 4c. The git root, extracted from the YAML and executed.
+# Three attempts: each one that reported an error gets its own ::error::,
+# naming the attempt and its slot. One that reported none, or did not
+# run, prints nothing.
+out=$(EXECUTION_FILE="$exec_dir/crash.json" EXECUTION_FILE_2="$exec_dir/clean.json" \
+  EXECUTION_FILE_3="$exec_dir/two.json" SLOT_1=4 SLOT_2=1 SLOT_3=2 \
+  bash "$agent_error_snippet" 2>&1) || fail "agent-error step exited non-zero for three attempts"
+want_1="::error::The review agent reported an error (attempt 1, slot 4): ${crash_text}"
+want_3="::error::The review agent reported an error (attempt 3, slot 2): second"
+if [ "$(grep -c '^::error::' <<<"$out")" -eq 2 ] && grep -qxF "$want_1" <<<"$out" \
+    && grep -qxF "$want_3" <<<"$out"; then
+  ok "agent-error step prints one ::error:: per attempt that reported an error"
+else
+  fail "agent-error step for three attempts printed: ${out}"
+fi
+if out=$(EXECUTION_FILE='' EXECUTION_FILE_2='' EXECUTION_FILE_3='' bash "$agent_error_snippet" 2>&1) \
+    && [ -z "$out" ]; then
+  ok "agent-error step prints nothing when no attempt ran"
+else
+  fail "agent-error step printed '${out}' when no attempt ran"
+fi
+
+## 4c. Credential rotation: the classifier, extracted from the YAML and
+## executed, and the wiring of the three attempts.
+
+# The three classifier steps run one block, written three times. They
+# must not drift: a pattern added to one would rotate on attempt 1 and
+# not on attempt 2.
+extract_run_block "$IMPL" greenlight-rotate-1 > "$rotate_snippet"
+if [ ! -s "$rotate_snippet" ]; then
+  fail "could not extract the greenlight-rotate-1 block from $IMPL"
+  exit 1
+fi
+for n in 2 3; do
+  if diff -q "$rotate_snippet" <(extract_run_block "$IMPL" "greenlight-rotate-${n}") >/dev/null; then
+    ok "classifier block ${n} is word for word classifier block 1"
+  else
+    fail "classifier block ${n} differs from block 1; the three must be identical:
+$(diff "$rotate_snippet" <(extract_run_block "$IMPL" "greenlight-rotate-${n}") || true)"
+  fi
+done
+
+# Each classifier reads its own attempt and slot, and names the next slot;
+# each later attempt runs only on the previous classifier's say-so.
+agent_ids=(agent agent_2 agent_3)
+for n in 1 2 3; do
+  block=$(step_block "Check attempt ${n} for a quota or auth error")
+  agent_id=${agent_ids[$((n - 1))]}
+  slot="slot_${slot_letters[$((n - 1))]}"
+  if [ "$n" -lt 3 ]; then
+    next_line="          NEXT_SLOT: \${{ steps.order.outputs.slot_${slot_letters[$n]} }}"
+  else
+    next_line="          NEXT_SLOT: ''"
+  fi
+  if grep -qxF "        id: rotate_${n}" <<<"$block" \
+     && grep -qxF "          ATTEMPT: '${n}'" <<<"$block" \
+     && grep -qxF "          EXECUTION_FILE: \${{ steps.${agent_id}.outputs.execution_file }}" <<<"$block" \
+     && grep -qxF "          SLOT: \${{ steps.order.outputs.${slot} }}" <<<"$block" \
+     && grep -qxF "$next_line" <<<"$block" \
+     && grep -qxF '          DEADLINE: ${{ steps.order.outputs.deadline }}' <<<"$block" \
+     && grep -qxF '        continue-on-error: true' <<<"$block"; then
+    ok "classifier ${n} reads ${agent_id}'s execution file and ${slot}"
+  else
+    fail "classifier ${n} must be id rotate_${n}, carry continue-on-error, and read ${agent_id}'s execution file, ${slot}, the next slot and the deadline"
+  fi
+done
+for n in 2 3; do
+  want="        if: env.REVIEW_FATAL == '' && steps.rotate_$((n - 1)).outputs.next == 'true'"
+  if step_block "Run the review agent (attempt ${n})" | grep -qxF "$want"; then
+    ok "attempt ${n} runs only when classifier $((n - 1)) says next=true"
+  else
+    fail "attempt ${n} must carry '${want# *}'"
+  fi
+done
+
+rotate_dir="$scratch/rotate"
+mkdir -p "$rotate_dir"
+result_file() {
+  # $1 file name, $2 is_error, $3 result text
+  jq -n --argjson e "$2" --arg r "$3" --arg t "$TRANSCRIPT_SECRET" \
+    '[{type: "system", subtype: "init"},
+      {type: "assistant", message: {content: [{type: "text", text: $t}]}},
+      {type: "result", subtype: "success", is_error: $e, result: $r}]' > "$rotate_dir/$1"
+}
+result_file epoch.json true 'Claude AI usage limit reached|1761955200'
+result_file resets.json true "You've hit your weekly limit · resets Nov 3, 5pm (America/New_York)"
+result_file session.json true "You've hit your session limit · resets 3pm"
+result_file credits.json true "You're out of extra usage · add funds to continue"
+result_file auth401.json true "$crash_text"
+result_file invalid-key.json true 'Invalid API key · Please run /login'
+result_file revoked.json true 'OAuth token revoked · Please run /login'
+result_file rate429.json true 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}'
+result_file rejected429.json true 'API Error: Request rejected (429) · this may be a temporary capacity issue.'
+result_file model.json true 'API Error: 500 {"type":"error","error":{"type":"api_error","message":"Internal server error"}}'
+result_file overloaded.json true 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}'
+result_file other.json true 'Reached maximum number of turns'
+result_file clean.json false '{"verdict":"approve"}'
+result_file quota-in-clean.json false "You've hit your weekly limit · resets 5pm"
+result_file nasty.json true $'You\'ve hit your limit · resets 5pm%0A\n::error::injected'
+printf 'not json' > "$rotate_dir/garbage.json"
+cp "$exec_dir/no-result.json" "$rotate_dir/no-result.json"
+
+# Times computed here, so the expectations do not depend on the runner's
+# zone.
+epoch_text=$(date -u -d @1761955200 '+%Y-%m-%d %H:%M UTC')
+
+# file | slot | next slot | minutes left in the budget | rotate | kind | resets | next | case label
+rotate_cases=(
+  "epoch.json|3|1|10|true|quota|${epoch_text}|true|a usage limit with an epoch reset"
+  "resets.json|1|4|10|true|quota|Nov 3, 5pm (America/New_York)|true|a weekly limit with a resets time"
+  "session.json|2|5|10|true|quota|3pm|true|a session limit"
+  "credits.json|2|5|10|true|quota|unknown|true|out of extra usage"
+  "auth401.json|4|2|10|true|auth|unknown|true|a 401"
+  "invalid-key.json|4|2|10|true|auth|unknown|true|an invalid API key"
+  "revoked.json|5|1|10|true|auth|unknown|true|a revoked OAuth token"
+  "rate429.json|1|2|10|true|quota|unknown|true|a 429 rate_limit_error"
+  "rejected429.json|1|2|10|true|quota|unknown|true|a 429 the API rejected"
+  "model.json|1|2|10|false||unknown|false|a model error"
+  "overloaded.json|1|2|10|false||unknown|false|an overloaded API"
+  "other.json|1|2|10|false||unknown|false|an is_error that is not quota or auth"
+  "clean.json|1|2|10|false||unknown|false|a clean result"
+  "quota-in-clean.json|1|2|10|false||unknown|false|quota text in a result that is not an error"
+  "no-result.json|1|2|10|false||unknown|false|no result entry, as after a timeout"
+  "garbage.json|1|2|10|false||unknown|false|an unparseable execution file"
+  "MISSING|1|2|10|false||unknown|false|no execution file"
+  "EMPTY|1|2|10|false||unknown|false|no execution_file output"
+  "resets.json|1||10|true|quota|Nov 3, 5pm (America/New_York)|false|a quota error with no slot left"
+  "resets.json|1|4|1|true|quota|Nov 3, 5pm (America/New_York)|false|a quota error with under 2 minutes left"
+  "resets.json|1|4|0|true|quota|Nov 3, 5pm (America/New_York)|false|a quota error past the deadline"
+  "resets.json|key||10|true|quota|Nov 3, 5pm (America/New_York)|false|a quota error on the API key"
+  "nasty.json|1|2|10|true|quota|5pm|true|a reset time carrying a workflow command"
+)
+
+for case in "${rotate_cases[@]}"; do
+  IFS='|' read -r file slot next_slot minutes want_rotate want_kind want_resets want_next label <<<"$case"
+  case "$file" in
+    MISSING) path="$rotate_dir/missing.json" ;;
+    EMPTY) path='' ;;
+    *) path="$rotate_dir/$file" ;;
+  esac
+  rotate_out="$scratch/rotate-out"
+  : > "$rotate_out"
+  deadline=$(( $(date +%s) + minutes * 60 + 30 ))
+  [ "$minutes" = 0 ] && deadline=$(( $(date +%s) - 60 ))
+
+  if out=$(ATTEMPT=1 EXECUTION_FILE="$path" SLOT="$slot" NEXT_SLOT="$next_slot" \
+      DEADLINE="$deadline" GITHUB_OUTPUT="$rotate_out" bash "$rotate_snippet" 2>&1); then
+    ok "classifier exits 0 for ${label}"
+  else
+    fail "classifier exited non-zero for ${label}: ${out}"
+  fi
+
+  got="$(sed -n 's/^rotate=//p' "$rotate_out")|$(sed -n 's/^kind=//p' "$rotate_out")|$(sed -n 's/^resets=//p' "$rotate_out")|$(sed -n 's/^next=//p' "$rotate_out")"
+  want="${want_rotate}|${want_kind}|${want_resets}|${want_next}"
+  if [ "$got" = "$want" ]; then
+    ok "classifier gives rotate|kind|resets|next = ${want} for ${label}"
+  else
+    fail "classifier gave '${got}', expected '${want}', for ${label}"
+  fi
+
+  if [ "$want_rotate" = true ]; then
+    if [ "$slot" = key ]; then who="ANTHROPIC_API_KEY"; else who="slot ${slot}"; fi
+    if [ "$want_next" = true ]; then
+      then_what="trying slot ${next_slot}"
+    elif [ -z "$next_slot" ]; then
+      then_what="no slot left to try"
+    else
+      then_what="no time left to try slot ${next_slot}"
+    fi
+    want_line="::warning::review credential ${who} hit ${want_kind} (resets ${want_resets}); ${then_what}"
+    if [ "$(grep -c '^::' <<<"$out")" -eq 1 ] && grep -qxF "$want_line" <<<"$out"; then
+      ok "classifier warns '${want_line#::warning::}' for ${label}"
+    else
+      fail "classifier printed '${out}' for ${label}, expected the one line '${want_line}'"
+    fi
+  elif grep -q '^::' <<<"$out"; then
+    fail "classifier printed a workflow command for ${label}, which does not rotate: ${out}"
+  fi
+
+  # No error text and no transcript text: the agent-error step prints
+  # the one, and nothing prints the other.
+  if grep -qF "$TRANSCRIPT_SECRET" <<<"$out" || grep -qiE 'api error|invalid api key|maximum number' <<<"$out"; then
+    fail "classifier printed the error or transcript text for ${label}: ${out}"
+  fi
+  if [ "$(grep -c '^rotate=' "$rotate_out")" -ne 1 ] || [ "$(wc -l <"$rotate_out")" -ne 6 ]; then
+    fail "classifier wrote other than its six output lines for ${label}: $(cat "$rotate_out")"
+  fi
+done
+
+# minutes_left is what attempt 2 or 3 gets as its cap: whole minutes left
+# in the budget, never more.
+rotate_out="$scratch/rotate-out"
+: > "$rotate_out"
+ATTEMPT=1 EXECUTION_FILE="$rotate_dir/resets.json" SLOT=1 NEXT_SLOT=2 \
+  DEADLINE=$(( $(date +%s) + 7 * 60 + 30 )) GITHUB_OUTPUT="$rotate_out" \
+  bash "$rotate_snippet" >/dev/null 2>&1 || true
+if [ "$(sed -n 's/^minutes_left=//p' "$rotate_out")" = 7 ]; then
+  ok "classifier gives the whole minutes left in the budget"
+else
+  fail "classifier gave minutes_left '$(sed -n 's/^minutes_left=//p' "$rotate_out")' with 7.5 minutes left, expected 7"
+fi
+
+## 4d. The git root, extracted from the YAML and executed.
 
 # After the step, the git commands claude-code-action v1.0.226 runs in
 # its working directory (src/github/operations/git-config.ts,
@@ -1332,7 +1810,7 @@ else
   fail "git-root step exited non-zero when the root is already a repository"
 fi
 
-## 4d. The report job's verdict, annotation and job summary, extracted
+## 4e. The report job's verdict, annotation and job summary, extracted
 ## from the YAML and executed.
 
 extract_run_block "$IMPL" greenlight-verdict-resolve > "$resolve_snippet"

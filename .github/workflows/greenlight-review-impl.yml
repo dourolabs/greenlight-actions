@@ -59,18 +59,32 @@ on:
         type: string
         default: ''
     secrets:
-      # Exactly one of these two authenticates the review agent. Neither is
-      # `required: true`, because `workflow_call` cannot express "exactly one
-      # of". The `Check the agent credentials` step on the `review` job below
-      # enforces it instead. It says so in an `::error::` annotation and turns
-      # the run into an errored check run naming the cause — which is the
-      # diagnostic `required: true` used to buy, without the red X on the base
-      # branch that a failed job would leave.
+      # The agent authenticates with the API key, or with one or more of the
+      # five OAuth token slots: CLAUDE_CODE_OAUTH_TOKEN is slot 1 and
+      # CLAUDE_CODE_OAUTH_TOKEN_2 to _5 are slots 2 to 5. None is
+      # `required: true`, because `workflow_call` cannot express "the key or
+      # some slots, not both". The `Check the agent credentials` step on the
+      # `review` job below enforces it instead. It says so in an `::error::`
+      # annotation and turns the run into an errored check run naming the
+      # cause — which is the diagnostic `required: true` used to buy, without
+      # the red X on the base branch that a failed job would leave.
       ANTHROPIC_API_KEY:
         description: "Anthropic API key. Set it once as an org-level Actions secret; the caller passes it by name under `secrets:`."
         required: false
       CLAUDE_CODE_OAUTH_TOKEN:
-        description: "Claude Code OAuth token, an alternative to ANTHROPIC_API_KEY. Set exactly one of the two."
+        description: "Claude Code OAuth token, slot 1. An alternative to ANTHROPIC_API_KEY: set the key or OAuth slots, not both."
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN_2:
+        description: "Claude Code OAuth token, slot 2. Optional."
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN_3:
+        description: "Claude Code OAuth token, slot 3. Optional."
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN_4:
+        description: "Claude Code OAuth token, slot 4. Optional."
+        required: false
+      CLAUDE_CODE_OAUTH_TOKEN_5:
+        description: "Claude Code OAuth token, slot 5. Optional."
         required: false
 
 # No workflow-level `permissions:` block on purpose. Each job declares
@@ -99,12 +113,15 @@ jobs:
     permissions:
       contents: read
     # A backstop, not the budget. The budget is `timeout-minutes` on the
-    # agent step below, because a *step* timeout fails that step — which
+    # agent steps below, because a *step* timeout fails that step — which
     # `continue-on-error` turns into an error verdict — while a *job* timeout
     # cancels the job outright and leaves nothing running to catch it.
-    # Two minutes above the step's cap, and both comfortably under the
-    # dispatch timeout greenlight is getting (20 minutes by default), so
-    # a stuck agent resolves here rather than racing that timeout.
+    # The up to three agent attempts share one 14-minute budget, which the
+    # order step starts: attempt 1 is capped at 14 minutes, and attempts 2
+    # and 3 get only what is left of it. Two minutes above that budget, and
+    # both comfortably under the dispatch timeout greenlight is getting
+    # (20 minutes by default), so a stuck agent resolves here rather than
+    # racing that timeout.
     timeout-minutes: 16
     # `REVIEW_FATAL` is the channel the guard steps below use. Whichever
     # one catches a known failure writes the reason to `$GITHUB_ENV`;
@@ -119,7 +136,8 @@ jobs:
       summary: ${{ steps.verdict.outputs.summary }}
     steps:
       # Credentials first, before either checkout. `workflow_call` cannot
-      # say "exactly one of these two secrets", so this step says it.
+      # say "the API key or one or more OAuth slots, not both", so this
+      # step says it.
       #
       # "Both set" is recorded as a failure, on purpose. The action accepts
       # both inputs and resolves them by some internal order this workflow
@@ -128,7 +146,9 @@ jobs:
       # costs one line instead.
       #
       # This runs before the checkouts so a credential mistake costs zero
-      # clones. It prints only secret *names*, never a value.
+      # clones. It prints only secret *names* and slot numbers, never a
+      # value. The `slots` output is the list of set slot numbers, or `key`,
+      # for the order step below.
       #
       # greenlight-credential-guard:begin
       - name: Check the agent credentials
@@ -137,27 +157,41 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN_2: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_2 }}
+          CLAUDE_CODE_OAUTH_TOKEN_3: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_3 }}
+          CLAUDE_CODE_OAUTH_TOKEN_4: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_4 }}
+          CLAUDE_CODE_OAUTH_TOKEN_5: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_5 }}
         run: |
           set -euo pipefail
 
           if [ -n "${ANTHROPIC_API_KEY:-}" ]; then key=yes; else key=no; fi
-          if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then token=yes; else token=no; fi
+
+          # Slot 1 is CLAUDE_CODE_OAUTH_TOKEN; slot n is CLAUDE_CODE_OAUTH_TOKEN_n.
+          slots=''
+          if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then slots=1; fi
+          for n in 2 3 4 5; do
+            name="CLAUDE_CODE_OAUTH_TOKEN_${n}"
+            if [ -n "${!name:-}" ]; then slots="${slots:+${slots} }${n}"; fi
+          done
+
+          oauth_names="CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CODE_OAUTH_TOKEN_2, CLAUDE_CODE_OAUTH_TOKEN_3,
+            CLAUDE_CODE_OAUTH_TOKEN_4 and CLAUDE_CODE_OAUTH_TOKEN_5"
 
           fatal=''
 
-          if [ "$key" = no ] && [ "$token" = no ]; then
-            fatal="The review agent has no credential. Set exactly one of the Actions secrets
-              ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, and make sure the caller workflow passes
-              both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN by name under 'secrets:'.
+          if [ "$key" = no ] && [ -z "$slots" ]; then
+            fatal="The review agent has no credential. Set the Actions secret ANTHROPIC_API_KEY, or one or
+              more of the OAuth token slots ${oauth_names}, and make sure the caller workflow passes
+              ANTHROPIC_API_KEY and all five OAuth slots by name under 'secrets:'.
               'secrets: inherit' does not reach a workflow in another org. An org-level secret also
               needs a repository-access policy covering this repository.
               See README.md#set-the-agent-credential in dourolabs/greenlight-actions."
-          elif [ "$key" = yes ] && [ "$token" = yes ]; then
-            fatal="Both ANTHROPIC_API_KEY and CLAUDE_CODE_OAUTH_TOKEN are visible to this run.
-              Set exactly one: this workflow does not pick between them, because a silent precedence
-              makes a credential change hard to debug. Remove one secret, or narrow its org-level
-              repository-access policy so it does not reach this repository.
-              See README.md#set-the-agent-credential in dourolabs/greenlight-actions."
+          elif [ "$key" = yes ] && [ -n "$slots" ]; then
+            fatal="Both ANTHROPIC_API_KEY and OAuth slot(s) ${slots} are visible to this run. Set the API key
+              or OAuth slots (${oauth_names}), not both: this workflow does not pick between them,
+              because a silent precedence makes a credential change hard to debug. Remove the key or
+              the slots, or narrow their org-level repository-access policy so they do not reach this
+              repository. See README.md#set-the-agent-credential in dourolabs/greenlight-actions."
           fi
 
           if [ -n "$fatal" ]; then
@@ -176,8 +210,10 @@ jobs:
 
           if [ "$key" = yes ]; then
             echo "authenticating the review agent with ANTHROPIC_API_KEY"
+            echo "slots=key" >> "$GITHUB_OUTPUT"
           else
-            echo "authenticating the review agent with CLAUDE_CODE_OAUTH_TOKEN"
+            echo "OAuth slots set: ${slots}"
+            echo "slots=${slots}" >> "$GITHUB_OUTPUT"
           fi
       # greenlight-credential-guard:end
 
@@ -424,6 +460,62 @@ jobs:
           } >> "$GITHUB_OUTPUT"
       # greenlight-prompt-guard:end
 
+      # The order in which this run tries the credential slots: the set
+      # slots in a random order, so no single token takes every review. The
+      # agent runs up to three times, on `slot_a`, then `slot_b`, then
+      # `slot_c`; each is empty when fewer slots are set. With the API key
+      # `slot_a` is `key` and there is no second attempt.
+      #
+      # Slot numbers only, never a token: GitHub drops a step output that
+      # holds a secret. Each agent step looks its token up by slot number.
+      #
+      # `deadline` starts the agents' shared time budget. It runs just
+      # before the agent, so attempt 1's own 14-minute cap and this budget
+      # end together, and attempts 2 and 3 get only what is left.
+      #
+      # greenlight-credential-order:begin
+      - name: Pick the credential order
+        id: order
+        if: env.REVIEW_FATAL == ''
+        continue-on-error: true
+        env:
+          SLOTS: ${{ steps.creds.outputs.slots }}
+        run: |
+          set -euo pipefail
+
+          AGENT_BUDGET_MINUTES=14
+
+          read -r -a slots <<<"${SLOTS:-}"
+          fatal=''
+          if [ "${#slots[@]}" -eq 0 ]; then
+            fatal="The credential check passed no credential slots to the order step. Read the
+              'Check the agent credentials' step log on the linked run."
+          fi
+          for slot in "${slots[@]}"; do
+            case "$slot" in
+              1|2|3|4|5|key) ;;
+              *) fatal="The credential check passed an unknown credential slot to the order step." ;;
+            esac
+          done
+
+          if [ -n "$fatal" ]; then
+            # One line, and exit 0 — see the credential guard above.
+            fatal=$(printf '%s' "$fatal" | tr '\n\r' '  ' | tr -s ' ')
+            echo "::error::${fatal}"
+            echo "REVIEW_FATAL=${fatal}" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          mapfile -t order < <(printf '%s\n' "${slots[@]}" | shuf)
+          echo "credential order: ${order[*]} (the agent tries at most the first 3)"
+          {
+            echo "slot_a=${order[0]:-}"
+            echo "slot_b=${order[1]:-}"
+            echo "slot_c=${order[2]:-}"
+            echo "deadline=$(( $(date +%s) + AGENT_BUDGET_MINUTES * 60 ))"
+          } >> "$GITHUB_OUTPUT"
+      # greenlight-credential-order:end
+
       # The guards above exit 0 on every failure they know about, which
       # leaves one hole: a guard that fails for a reason it does not know
       # about — a bad `jq`, a runner that lost its disk — sets no
@@ -440,6 +532,7 @@ jobs:
         env:
           CREDS_OUTCOME: ${{ steps.creds.outcome }}
           PROMPT_OUTCOME: ${{ steps.prompt.outcome }}
+          ORDER_OUTCOME: ${{ steps.order.outcome }}
         run: |
           set -uo pipefail
 
@@ -458,6 +551,10 @@ jobs:
             fatal="The review job's prompt step ended '${PROMPT_OUTCOME:-unknown}' for a reason it does
               not recognise, so the agent was never given a prompt. Read the step log on the linked
               run."
+          elif [ "${ORDER_OUTCOME:-}" != success ]; then
+            fatal="The review job's credential order step ended '${ORDER_OUTCOME:-unknown}' for a reason
+              it does not recognise, so the agent has no credential slot to use. Read the step log on
+              the linked run."
           fi
 
           if [ -n "$fatal" ]; then
@@ -510,53 +607,549 @@ jobs:
         # The real time budget, and a step cap rather than the job cap on
         # purpose — a step that overruns fails, and a failed step is
         # already an error verdict, while a job that overruns is cancelled and
-        # cannot be caught from inside.
+        # cannot be caught from inside. It equals AGENT_BUDGET_MINUTES in
+        # the order step, which starts the budget attempts 2 and 3 share.
         timeout-minutes: 14
         uses: anthropics/claude-code-action@v1.0.226
+        # Attempts 2 and 3 below carry this same `with:` block, with
+        # `slot_b` and `slot_c` in place of `slot_a`.
+        #
+        # `github_token` is this job's own token, and a security control
+        # rather than plumbing. Left unset, the action exchanges an OIDC
+        # token with Anthropic for a GitHub App token whose default scopes
+        # are `contents: write`, `pull_requests: write` and `issues: write`
+        # — minted inside the one job whose entire design is that it holds
+        # no write permission. Passing `github.token` short-circuits that
+        # exchange, so the agent holds exactly the `contents: read` this
+        # job declares. Without it the step fails with `Could not fetch an
+        # OIDC token. Did you remember to add id-token: write`; granting
+        # that permission is the wrong repair.
+        #
+        # `allowed_bots`: greenlight dispatches this workflow as its own
+        # GitHub App, and the action refuses a bot-initiated run unless the
+        # bot is named: `Workflow initiated by non-human actor`. Named
+        # rather than `*`, which would admit any App able to dispatch this
+        # workflow — and a dispatch carries the prompt path.
+        #
+        # `classify_inline_comments: "false"`: no PR event context here, and
+        # a `contents: read` token, so the action's inline-comment post-step
+        # has nothing to post and would only risk failing the job. The check
+        # run is the whole contract; comments are incidental.
+        #
+        # No `--allowedTools` in `claude_args`, on purpose: the agent gets
+        # no shell. It holds the agent credential, `./head` is untrusted,
+        # and allowed git could run a program through config the agent can
+        # edit in `head/.git/config`. The diff step above writes what git
+        # would have shown it.
         with:
-          # Both, unconditionally. `with:` keys cannot be omitted
-          # conditionally, an unset secret renders empty, and the action
-          # treats empty as absent — so the guard step above has already
-          # established that exactly one of these two carries a value.
+          # Unconditionally. `with:` keys cannot be omitted conditionally,
+          # an unset secret renders empty, and the action treats empty as
+          # absent — so the guard step above has already established that
+          # the key and the OAuth slots are not both set.
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # This job's own token, and a security control rather than
-          # plumbing. Left unset, the action exchanges an OIDC token with
-          # Anthropic for a GitHub App token whose default scopes are
-          # `contents: write`, `pull_requests: write` and `issues: write`
-          # — minted inside the one job whose entire design is that it
-          # holds no write permission. Passing `github.token` short-circuits
-          # that exchange, so the agent holds exactly the `contents: read`
-          # this job declares. Without it the step fails with `Could not
-          # fetch an OIDC token. Did you remember to add id-token: write`;
-          # granting that permission is the wrong repair.
+          # The token for this attempt's slot, looked up by number. An
+          # explicit `||` chain rather than `secrets[format(...)]`, so
+          # actionlint checks every secret name in it. `key`, or an empty
+          # slot, matches none of them and passes an empty token.
+          claude_code_oauth_token: >-
+            ${{
+              steps.order.outputs.slot_a == '1' && secrets.CLAUDE_CODE_OAUTH_TOKEN
+              || steps.order.outputs.slot_a == '2' && secrets.CLAUDE_CODE_OAUTH_TOKEN_2
+              || steps.order.outputs.slot_a == '3' && secrets.CLAUDE_CODE_OAUTH_TOKEN_3
+              || steps.order.outputs.slot_a == '4' && secrets.CLAUDE_CODE_OAUTH_TOKEN_4
+              || steps.order.outputs.slot_a == '5' && secrets.CLAUDE_CODE_OAUTH_TOKEN_5
+              || ''
+            }}
           github_token: ${{ github.token }}
-          # Greenlight dispatches this workflow as its own GitHub App, and
-          # the action refuses a bot-initiated run unless the bot is named:
-          # `Workflow initiated by non-human actor`. Named rather than `*`,
-          # which would admit any App able to dispatch this workflow — and
-          # a dispatch carries the prompt path.
           allowed_bots: dourolabs-greenlight
           prompt: ${{ steps.prompt.outputs.text }}
-          # No PR event context here, and a `contents: read` token: the
-          # action's inline-comment post-step has nothing to post and
-          # would only risk failing the job. The check run is the whole
-          # contract; comments are incidental.
           classify_inline_comments: "false"
-          # No `--allowedTools`, on purpose: the agent gets no shell. It
-          # holds the agent credential, `./head` is untrusted, and allowed
-          # git could run a program through config the agent can edit in
-          # `head/.git/config`. The diff step above writes what git would
-          # have shown it.
           claude_args: |
             --model claude-opus-5
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","reject"]},"summary":{"type":"string"}},"required":["verdict","summary"],"additionalProperties":false}'
 
-      # The agent's result message, printed when the agent reports an
-      # error. Full output stays off, because it prints every tool result
-      # and those can hold secrets. The result message is the agent's
-      # last word only, such as an API error or "Claude did not return
-      # structured_output", and GitHub masks any secret value that
+      # Decides whether the attempt above failed on its credential: a
+      # usage limit, quota or rate limit (429), or an auth error (401, an
+      # invalid, revoked or expired token). Only then does the next attempt
+      # run, on the next slot. Every other failure — a timeout, no result
+      # entry, a model error, no structured output — does not rotate, so a
+      # PR that breaks the agent cannot burn every token.
+      #
+      # It reads only the last `result` entry of the attempt's execution
+      # file, and only when that entry says `is_error`. The patterns live
+      # in this block, which the three attempts share word for word;
+      # scripts/check-review-workflow.sh fails if the copies differ. It
+      # prints slot numbers and the reset time, never the error text: the
+      # `Print the agent's error` step prints that.
+      #
+      # greenlight-rotate-1:begin
+      - name: Check attempt 1 for a quota or auth error
+        id: rotate_1
+        if: ${{ !cancelled() && (steps.agent.outcome == 'success' || steps.agent.outcome == 'failure') }}
+        continue-on-error: true
+        env:
+          ATTEMPT: '1'
+          EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+          SLOT: ${{ steps.order.outputs.slot_a }}
+          NEXT_SLOT: ${{ steps.order.outputs.slot_b }}
+          DEADLINE: ${{ steps.order.outputs.deadline }}
+        run: |
+          set -uo pipefail
+
+          # kind|pattern. Extended regular expressions, matched case-insensitively
+          # against the result text of an `is_error` result entry. The first match
+          # wins, and quota is tried before auth. README.md, "Credential rotation",
+          # says where each pattern comes from.
+          patterns=(
+            "quota|you.ve hit your [a-z0-9' -]*(limit|budget)"
+            "quota|you.re out of (usage credits|extra usage)"
+            "quota|usage limit reached"
+            "quota|spend limit reached"
+            "quota|credit balance (is )?too low"
+            "quota|billing_error"
+            "quota|rate_limit_error"
+            "quota|request rejected \(429\)"
+            "quota|api error: 429"
+            "quota|429 too many requests"
+            "auth|invalid api key"
+            "auth|invalid x-api-key"
+            "auth|invalid bearer token"
+            "auth|oauth token (has )?(expired|revoked)"
+            "auth|login expired"
+            "auth|failed to authenticate"
+            "auth|not logged in"
+            "auth|please run /login"
+            "auth|authentication_error"
+            "auth|api error: 401"
+            "auth|401 unauthorized"
+          )
+
+          rotate=false
+          kind=''
+          resets=unknown
+          resets_epoch=''
+
+          if [ "${SLOT:-}" = key ]; then label=ANTHROPIC_API_KEY; else label="slot ${SLOT:-unknown}"; fi
+
+          finish() {
+            {
+              echo "rotate=${rotate}"
+              echo "kind=${kind}"
+              echo "resets=${resets}"
+              echo "resets_epoch=${resets_epoch}"
+              echo "next=${next:-false}"
+              echo "minutes_left=${minutes_left:-0}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # No execution file, no result entry, or a result that is not an error:
+          # none of these is a credential failure.
+          if [ -z "${EXECUTION_FILE:-}" ] || [ ! -f "${EXECUTION_FILE}" ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) wrote no execution file; not rotating"
+            finish
+          fi
+          result=$(jq -c '[.[]? | objects | select(.type == "result")] | last // empty' \
+            "${EXECUTION_FILE}" 2>/dev/null) || result=''
+          if [ -z "${result}" ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) has no result entry; not rotating"
+            finish
+          fi
+          if [ "$(jq -r '.is_error == true' <<<"${result}")" != true ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) reported no error; not rotating"
+            finish
+          fi
+          text=$(jq -r '(.result // "") | tostring' <<<"${result}")
+
+          for entry in "${patterns[@]}"; do
+            if grep -qiE -- "${entry#*|}" <<<"${text}"; then
+              kind=${entry%%|*}
+              rotate=true
+              break
+            fi
+          done
+
+          if [ "${rotate}" != true ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) failed, but not on quota or auth; not rotating"
+            finish
+          fi
+
+          # The reset time, when the text carries one: older Claude Code wrote
+          # `...usage limit reached|<unix seconds>`, newer writes `resets <time>`.
+          # The text form keeps only characters that are safe in a workflow
+          # command and in a summary.
+          epoch=$(grep -oE '\|[0-9]{10}([^0-9]|$)' <<<"${text}" | head -1 | tr -cd '0-9')
+          if [ -n "${epoch}" ] && formatted=$(date -u -d "@${epoch}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null); then
+            resets=${formatted}
+            resets_epoch=${epoch}
+          else
+            when=$(grep -oiE 'resets? (at |in )?.*' <<<"${text}" | head -1 \
+              | sed -E 's/^[Rr][Ee][Ss][Ee][Tt][Ss]? (at |in )?//' \
+              | LC_ALL=C sed -E 's/[^A-Za-z0-9 :,()\/+_-].*//' \
+              | sed -E 's/[ ,]+$//' | cut -c1-60)
+            if [ -n "${when}" ]; then resets=${when}; fi
+          fi
+
+          # Time left in the budget the order step started. The next attempt runs
+          # only with at least 2 minutes of it: the action alone takes most of a
+          # minute to install.
+          now=$(date +%s)
+          if [[ "${DEADLINE:-}" =~ ^[0-9]+$ ]] && [ "${DEADLINE}" -gt "${now}" ]; then
+            minutes_left=$(( (DEADLINE - now) / 60 ))
+          else
+            minutes_left=0
+          fi
+
+          next=false
+          if [ -z "${NEXT_SLOT:-}" ]; then
+            then_what="no slot left to try"
+          elif [ "${minutes_left}" -lt 2 ]; then
+            then_what="no time left to try slot ${NEXT_SLOT}"
+          else
+            next=true
+            then_what="trying slot ${NEXT_SLOT}"
+          fi
+
+          if [ "${SLOT:-}" = key ]; then
+            echo "::warning::review credential ANTHROPIC_API_KEY hit ${kind} (resets ${resets}); ${then_what}"
+          else
+            echo "::warning::review credential slot ${SLOT:-unknown} hit ${kind} (resets ${resets}); ${then_what}"
+          fi
+          finish
+      # greenlight-rotate-1:end
+
+      # Attempt 2: the same agent step, on `slot_b`, run only when attempt
+      # 1 failed on a quota or auth error and the budget has time left.
+      # Its cap is what is left of the shared budget.
+      - name: Run the review agent (attempt 2)
+        id: agent_2
+        if: env.REVIEW_FATAL == '' && steps.rotate_1.outputs.next == 'true'
+        continue-on-error: true
+        timeout-minutes: ${{ fromJSON(steps.rotate_1.outputs.minutes_left || '2') }}
+        uses: anthropics/claude-code-action@v1.0.226
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: >-
+            ${{
+              steps.order.outputs.slot_b == '1' && secrets.CLAUDE_CODE_OAUTH_TOKEN
+              || steps.order.outputs.slot_b == '2' && secrets.CLAUDE_CODE_OAUTH_TOKEN_2
+              || steps.order.outputs.slot_b == '3' && secrets.CLAUDE_CODE_OAUTH_TOKEN_3
+              || steps.order.outputs.slot_b == '4' && secrets.CLAUDE_CODE_OAUTH_TOKEN_4
+              || steps.order.outputs.slot_b == '5' && secrets.CLAUDE_CODE_OAUTH_TOKEN_5
+              || ''
+            }}
+          github_token: ${{ github.token }}
+          allowed_bots: dourolabs-greenlight
+          prompt: ${{ steps.prompt.outputs.text }}
+          classify_inline_comments: "false"
+          claude_args: |
+            --model claude-opus-5
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","reject"]},"summary":{"type":"string"}},"required":["verdict","summary"],"additionalProperties":false}'
+
+      # greenlight-rotate-2:begin
+      - name: Check attempt 2 for a quota or auth error
+        id: rotate_2
+        if: ${{ !cancelled() && (steps.agent_2.outcome == 'success' || steps.agent_2.outcome == 'failure') }}
+        continue-on-error: true
+        env:
+          ATTEMPT: '2'
+          EXECUTION_FILE: ${{ steps.agent_2.outputs.execution_file }}
+          SLOT: ${{ steps.order.outputs.slot_b }}
+          NEXT_SLOT: ${{ steps.order.outputs.slot_c }}
+          DEADLINE: ${{ steps.order.outputs.deadline }}
+        run: |
+          set -uo pipefail
+
+          # kind|pattern. Extended regular expressions, matched case-insensitively
+          # against the result text of an `is_error` result entry. The first match
+          # wins, and quota is tried before auth. README.md, "Credential rotation",
+          # says where each pattern comes from.
+          patterns=(
+            "quota|you.ve hit your [a-z0-9' -]*(limit|budget)"
+            "quota|you.re out of (usage credits|extra usage)"
+            "quota|usage limit reached"
+            "quota|spend limit reached"
+            "quota|credit balance (is )?too low"
+            "quota|billing_error"
+            "quota|rate_limit_error"
+            "quota|request rejected \(429\)"
+            "quota|api error: 429"
+            "quota|429 too many requests"
+            "auth|invalid api key"
+            "auth|invalid x-api-key"
+            "auth|invalid bearer token"
+            "auth|oauth token (has )?(expired|revoked)"
+            "auth|login expired"
+            "auth|failed to authenticate"
+            "auth|not logged in"
+            "auth|please run /login"
+            "auth|authentication_error"
+            "auth|api error: 401"
+            "auth|401 unauthorized"
+          )
+
+          rotate=false
+          kind=''
+          resets=unknown
+          resets_epoch=''
+
+          if [ "${SLOT:-}" = key ]; then label=ANTHROPIC_API_KEY; else label="slot ${SLOT:-unknown}"; fi
+
+          finish() {
+            {
+              echo "rotate=${rotate}"
+              echo "kind=${kind}"
+              echo "resets=${resets}"
+              echo "resets_epoch=${resets_epoch}"
+              echo "next=${next:-false}"
+              echo "minutes_left=${minutes_left:-0}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # No execution file, no result entry, or a result that is not an error:
+          # none of these is a credential failure.
+          if [ -z "${EXECUTION_FILE:-}" ] || [ ! -f "${EXECUTION_FILE}" ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) wrote no execution file; not rotating"
+            finish
+          fi
+          result=$(jq -c '[.[]? | objects | select(.type == "result")] | last // empty' \
+            "${EXECUTION_FILE}" 2>/dev/null) || result=''
+          if [ -z "${result}" ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) has no result entry; not rotating"
+            finish
+          fi
+          if [ "$(jq -r '.is_error == true' <<<"${result}")" != true ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) reported no error; not rotating"
+            finish
+          fi
+          text=$(jq -r '(.result // "") | tostring' <<<"${result}")
+
+          for entry in "${patterns[@]}"; do
+            if grep -qiE -- "${entry#*|}" <<<"${text}"; then
+              kind=${entry%%|*}
+              rotate=true
+              break
+            fi
+          done
+
+          if [ "${rotate}" != true ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) failed, but not on quota or auth; not rotating"
+            finish
+          fi
+
+          # The reset time, when the text carries one: older Claude Code wrote
+          # `...usage limit reached|<unix seconds>`, newer writes `resets <time>`.
+          # The text form keeps only characters that are safe in a workflow
+          # command and in a summary.
+          epoch=$(grep -oE '\|[0-9]{10}([^0-9]|$)' <<<"${text}" | head -1 | tr -cd '0-9')
+          if [ -n "${epoch}" ] && formatted=$(date -u -d "@${epoch}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null); then
+            resets=${formatted}
+            resets_epoch=${epoch}
+          else
+            when=$(grep -oiE 'resets? (at |in )?.*' <<<"${text}" | head -1 \
+              | sed -E 's/^[Rr][Ee][Ss][Ee][Tt][Ss]? (at |in )?//' \
+              | LC_ALL=C sed -E 's/[^A-Za-z0-9 :,()\/+_-].*//' \
+              | sed -E 's/[ ,]+$//' | cut -c1-60)
+            if [ -n "${when}" ]; then resets=${when}; fi
+          fi
+
+          # Time left in the budget the order step started. The next attempt runs
+          # only with at least 2 minutes of it: the action alone takes most of a
+          # minute to install.
+          now=$(date +%s)
+          if [[ "${DEADLINE:-}" =~ ^[0-9]+$ ]] && [ "${DEADLINE}" -gt "${now}" ]; then
+            minutes_left=$(( (DEADLINE - now) / 60 ))
+          else
+            minutes_left=0
+          fi
+
+          next=false
+          if [ -z "${NEXT_SLOT:-}" ]; then
+            then_what="no slot left to try"
+          elif [ "${minutes_left}" -lt 2 ]; then
+            then_what="no time left to try slot ${NEXT_SLOT}"
+          else
+            next=true
+            then_what="trying slot ${NEXT_SLOT}"
+          fi
+
+          if [ "${SLOT:-}" = key ]; then
+            echo "::warning::review credential ANTHROPIC_API_KEY hit ${kind} (resets ${resets}); ${then_what}"
+          else
+            echo "::warning::review credential slot ${SLOT:-unknown} hit ${kind} (resets ${resets}); ${then_what}"
+          fi
+          finish
+      # greenlight-rotate-2:end
+
+      # Attempt 3, on `slot_c`. The last one: a quota or auth error here
+      # ends the run with every tried slot exhausted.
+      - name: Run the review agent (attempt 3)
+        id: agent_3
+        if: env.REVIEW_FATAL == '' && steps.rotate_2.outputs.next == 'true'
+        continue-on-error: true
+        timeout-minutes: ${{ fromJSON(steps.rotate_2.outputs.minutes_left || '2') }}
+        uses: anthropics/claude-code-action@v1.0.226
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: >-
+            ${{
+              steps.order.outputs.slot_c == '1' && secrets.CLAUDE_CODE_OAUTH_TOKEN
+              || steps.order.outputs.slot_c == '2' && secrets.CLAUDE_CODE_OAUTH_TOKEN_2
+              || steps.order.outputs.slot_c == '3' && secrets.CLAUDE_CODE_OAUTH_TOKEN_3
+              || steps.order.outputs.slot_c == '4' && secrets.CLAUDE_CODE_OAUTH_TOKEN_4
+              || steps.order.outputs.slot_c == '5' && secrets.CLAUDE_CODE_OAUTH_TOKEN_5
+              || ''
+            }}
+          github_token: ${{ github.token }}
+          allowed_bots: dourolabs-greenlight
+          prompt: ${{ steps.prompt.outputs.text }}
+          classify_inline_comments: "false"
+          claude_args: |
+            --model claude-opus-5
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","reject"]},"summary":{"type":"string"}},"required":["verdict","summary"],"additionalProperties":false}'
+
+      # greenlight-rotate-3:begin
+      - name: Check attempt 3 for a quota or auth error
+        id: rotate_3
+        if: ${{ !cancelled() && (steps.agent_3.outcome == 'success' || steps.agent_3.outcome == 'failure') }}
+        continue-on-error: true
+        env:
+          ATTEMPT: '3'
+          EXECUTION_FILE: ${{ steps.agent_3.outputs.execution_file }}
+          SLOT: ${{ steps.order.outputs.slot_c }}
+          NEXT_SLOT: ''
+          DEADLINE: ${{ steps.order.outputs.deadline }}
+        run: |
+          set -uo pipefail
+
+          # kind|pattern. Extended regular expressions, matched case-insensitively
+          # against the result text of an `is_error` result entry. The first match
+          # wins, and quota is tried before auth. README.md, "Credential rotation",
+          # says where each pattern comes from.
+          patterns=(
+            "quota|you.ve hit your [a-z0-9' -]*(limit|budget)"
+            "quota|you.re out of (usage credits|extra usage)"
+            "quota|usage limit reached"
+            "quota|spend limit reached"
+            "quota|credit balance (is )?too low"
+            "quota|billing_error"
+            "quota|rate_limit_error"
+            "quota|request rejected \(429\)"
+            "quota|api error: 429"
+            "quota|429 too many requests"
+            "auth|invalid api key"
+            "auth|invalid x-api-key"
+            "auth|invalid bearer token"
+            "auth|oauth token (has )?(expired|revoked)"
+            "auth|login expired"
+            "auth|failed to authenticate"
+            "auth|not logged in"
+            "auth|please run /login"
+            "auth|authentication_error"
+            "auth|api error: 401"
+            "auth|401 unauthorized"
+          )
+
+          rotate=false
+          kind=''
+          resets=unknown
+          resets_epoch=''
+
+          if [ "${SLOT:-}" = key ]; then label=ANTHROPIC_API_KEY; else label="slot ${SLOT:-unknown}"; fi
+
+          finish() {
+            {
+              echo "rotate=${rotate}"
+              echo "kind=${kind}"
+              echo "resets=${resets}"
+              echo "resets_epoch=${resets_epoch}"
+              echo "next=${next:-false}"
+              echo "minutes_left=${minutes_left:-0}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          # No execution file, no result entry, or a result that is not an error:
+          # none of these is a credential failure.
+          if [ -z "${EXECUTION_FILE:-}" ] || [ ! -f "${EXECUTION_FILE}" ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) wrote no execution file; not rotating"
+            finish
+          fi
+          result=$(jq -c '[.[]? | objects | select(.type == "result")] | last // empty' \
+            "${EXECUTION_FILE}" 2>/dev/null) || result=''
+          if [ -z "${result}" ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) has no result entry; not rotating"
+            finish
+          fi
+          if [ "$(jq -r '.is_error == true' <<<"${result}")" != true ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) reported no error; not rotating"
+            finish
+          fi
+          text=$(jq -r '(.result // "") | tostring' <<<"${result}")
+
+          for entry in "${patterns[@]}"; do
+            if grep -qiE -- "${entry#*|}" <<<"${text}"; then
+              kind=${entry%%|*}
+              rotate=true
+              break
+            fi
+          done
+
+          if [ "${rotate}" != true ]; then
+            echo "attempt ${ATTEMPT:-?} (${label}) failed, but not on quota or auth; not rotating"
+            finish
+          fi
+
+          # The reset time, when the text carries one: older Claude Code wrote
+          # `...usage limit reached|<unix seconds>`, newer writes `resets <time>`.
+          # The text form keeps only characters that are safe in a workflow
+          # command and in a summary.
+          epoch=$(grep -oE '\|[0-9]{10}([^0-9]|$)' <<<"${text}" | head -1 | tr -cd '0-9')
+          if [ -n "${epoch}" ] && formatted=$(date -u -d "@${epoch}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null); then
+            resets=${formatted}
+            resets_epoch=${epoch}
+          else
+            when=$(grep -oiE 'resets? (at |in )?.*' <<<"${text}" | head -1 \
+              | sed -E 's/^[Rr][Ee][Ss][Ee][Tt][Ss]? (at |in )?//' \
+              | LC_ALL=C sed -E 's/[^A-Za-z0-9 :,()\/+_-].*//' \
+              | sed -E 's/[ ,]+$//' | cut -c1-60)
+            if [ -n "${when}" ]; then resets=${when}; fi
+          fi
+
+          # Time left in the budget the order step started. The next attempt runs
+          # only with at least 2 minutes of it: the action alone takes most of a
+          # minute to install.
+          now=$(date +%s)
+          if [[ "${DEADLINE:-}" =~ ^[0-9]+$ ]] && [ "${DEADLINE}" -gt "${now}" ]; then
+            minutes_left=$(( (DEADLINE - now) / 60 ))
+          else
+            minutes_left=0
+          fi
+
+          next=false
+          if [ -z "${NEXT_SLOT:-}" ]; then
+            then_what="no slot left to try"
+          elif [ "${minutes_left}" -lt 2 ]; then
+            then_what="no time left to try slot ${NEXT_SLOT}"
+          else
+            next=true
+            then_what="trying slot ${NEXT_SLOT}"
+          fi
+
+          if [ "${SLOT:-}" = key ]; then
+            echo "::warning::review credential ANTHROPIC_API_KEY hit ${kind} (resets ${resets}); ${then_what}"
+          else
+            echo "::warning::review credential slot ${SLOT:-unknown} hit ${kind} (resets ${resets}); ${then_what}"
+          fi
+          finish
+      # greenlight-rotate-3:end
+
+      # The agent's result message, printed for each attempt whose result
+      # reports an error. Full output stays off, because it prints every
+      # tool result and those can hold secrets. The result message is the
+      # agent's last word only, such as an API error or "Claude did not
+      # return structured_output", and GitHub masks any secret value that
       # reaches the log. Escaping `%`, `\r` and `\n` keeps the whole text
       # inside the one `::error::` command, so no line of it can run a
       # workflow command of its own.
@@ -564,40 +1157,63 @@ jobs:
       # greenlight-agent-error:begin
       - name: Print the agent's error
         id: agent_error
-        if: ${{ !cancelled() && steps.agent.outputs.execution_file != '' }}
+        if: ${{ !cancelled() }}
         continue-on-error: true
         env:
           EXECUTION_FILE: ${{ steps.agent.outputs.execution_file }}
+          EXECUTION_FILE_2: ${{ steps.agent_2.outputs.execution_file }}
+          EXECUTION_FILE_3: ${{ steps.agent_3.outputs.execution_file }}
+          SLOT_1: ${{ steps.order.outputs.slot_a }}
+          SLOT_2: ${{ steps.order.outputs.slot_b }}
+          SLOT_3: ${{ steps.order.outputs.slot_c }}
         run: |
           set -uo pipefail
 
-          if [ ! -f "${EXECUTION_FILE}" ]; then
-            echo "no execution file at '${EXECUTION_FILE}'"
-            exit 0
-          fi
+          for attempt in 1 2 3; do
+            if [ "$attempt" = 1 ]; then file_var=EXECUTION_FILE; else file_var="EXECUTION_FILE_${attempt}"; fi
+            slot_var="SLOT_${attempt}"
+            file=${!file_var:-}
+            slot=${!slot_var:-}
+            where="attempt ${attempt}, slot ${slot:-unknown}"
 
-          result=$(jq -c '[.[]? | objects | select(.type == "result")] | last // empty' \
-            "${EXECUTION_FILE}" 2>/dev/null) || result=''
-          if [ -z "${result}" ]; then
-            echo "the execution file holds no result entry"
-            exit 0
-          fi
+            # No execution file: the attempt did not run, or died first.
+            if [ -z "${file}" ]; then
+              continue
+            fi
+            if [ ! -f "${file}" ]; then
+              echo "${where}: no execution file at '${file}'"
+              continue
+            fi
 
-          if [ "$(jq -r '.is_error == true' <<<"${result}")" != true ]; then
-            echo "the agent reported no error"
-            exit 0
-          fi
+            result=$(jq -c '[.[]? | objects | select(.type == "result")] | last // empty' \
+              "${file}" 2>/dev/null) || result=''
+            if [ -z "${result}" ]; then
+              echo "${where}: the execution file holds no result entry"
+              continue
+            fi
 
-          message=$(jq -r '(.result // "no result text") | tostring | .[0:2000]' <<<"${result}")
-          message=${message//'%'/'%25'}
-          message=${message//$'\r'/'%0D'}
-          message=${message//$'\n'/'%0A'}
-          echo "::error::The review agent reported an error: ${message}"
+            if [ "$(jq -r '.is_error == true' <<<"${result}")" != true ]; then
+              echo "${where}: the agent reported no error"
+              continue
+            fi
+
+            message=$(jq -r '(.result // "no result text") | tostring | .[0:2000]' <<<"${result}")
+            message=${message//'%'/'%25'}
+            message=${message//$'\r'/'%0D'}
+            message=${message//$'\n'/'%0A'}
+            echo "::error::The review agent reported an error (${where}): ${message}"
+          done
       # greenlight-agent-error:end
 
       # Normalise everything that happened above into exactly `approve`,
       # `reject` or `error`. The agent controls STRUCTURED_OUTPUT, so it
       # arrives via `env:` and is never interpolated into this script.
+      #
+      # It reads the agent attempt that ran last: attempt N runs only when
+      # attempt N-1 hit a quota or auth error, so the last one is the only
+      # one that can hold a verdict. When that one hit a quota or auth
+      # error too, every attempt did, and the verdict is an error naming
+      # the slots tried and the earliest reset time.
       #
       # greenlight-verdict-normalise:begin
       - name: Normalise the verdict
@@ -607,8 +1223,46 @@ jobs:
           STRUCTURED_OUTPUT: ${{ steps.agent.outputs.structured_output }}
           AGENT_CONCLUSION: ${{ steps.agent.outputs.conclusion }}
           AGENT_OUTCOME: ${{ steps.agent.outcome }}
+          STRUCTURED_OUTPUT_2: ${{ steps.agent_2.outputs.structured_output }}
+          AGENT_CONCLUSION_2: ${{ steps.agent_2.outputs.conclusion }}
+          AGENT_OUTCOME_2: ${{ steps.agent_2.outcome }}
+          STRUCTURED_OUTPUT_3: ${{ steps.agent_3.outputs.structured_output }}
+          AGENT_CONCLUSION_3: ${{ steps.agent_3.outputs.conclusion }}
+          AGENT_OUTCOME_3: ${{ steps.agent_3.outcome }}
+          SLOT_1: ${{ steps.order.outputs.slot_a }}
+          SLOT_2: ${{ steps.order.outputs.slot_b }}
+          SLOT_3: ${{ steps.order.outputs.slot_c }}
+          ROTATE_1: ${{ steps.rotate_1.outputs.rotate }}
+          ROTATE_2: ${{ steps.rotate_2.outputs.rotate }}
+          ROTATE_3: ${{ steps.rotate_3.outputs.rotate }}
+          RESETS_1: ${{ steps.rotate_1.outputs.resets }}
+          RESETS_2: ${{ steps.rotate_2.outputs.resets }}
+          RESETS_3: ${{ steps.rotate_3.outputs.resets }}
+          RESETS_EPOCH_1: ${{ steps.rotate_1.outputs.resets_epoch }}
+          RESETS_EPOCH_2: ${{ steps.rotate_2.outputs.resets_epoch }}
+          RESETS_EPOCH_3: ${{ steps.rotate_3.outputs.resets_epoch }}
         run: |
           set -uo pipefail
+
+          # The last attempt that ran. A step that never ran has outcome
+          # `skipped`, or nothing at all in a test.
+          last=1
+          for n in 2 3; do
+            outcome_var="AGENT_OUTCOME_${n}"
+            case "${!outcome_var:-}" in
+              success|failure|cancelled) last=$n ;;
+            esac
+          done
+          if [ "$last" != 1 ]; then
+            outcome_var="AGENT_OUTCOME_${last}"
+            conclusion_var="AGENT_CONCLUSION_${last}"
+            output_var="STRUCTURED_OUTPUT_${last}"
+            AGENT_OUTCOME=${!outcome_var:-}
+            AGENT_CONCLUSION=${!conclusion_var:-}
+            STRUCTURED_OUTPUT=${!output_var:-}
+          fi
+          rotate_var="ROTATE_${last}"
+          exhausted=${!rotate_var:-false}
 
           # Anything that is not an exact `approve` or `reject` from an
           # agent step that succeeded is an error: greenlight records no
@@ -627,6 +1281,32 @@ jobs:
             # and let the job carry on green rather than reddening the base
             # branch's tip commit. Its diagnostic is the summary.
             summary="${REVIEW_FATAL}"
+          elif [ "${exhausted}" = true ]; then
+            # Every attempt hit a quota or auth error. Name the slots tried
+            # and the earliest reset: the earliest exact time when any
+            # attempt gave one, else the first reset text, else unknown.
+            tried=''
+            earliest=unknown
+            earliest_epoch=''
+            for n in $(seq 1 "$last"); do
+              slot_var="SLOT_${n}"; resets_var="RESETS_${n}"; epoch_var="RESETS_EPOCH_${n}"
+              tried="${tried:+${tried} }${!slot_var:-unknown}"
+              epoch=${!epoch_var:-}
+              if [[ "${epoch}" =~ ^[0-9]+$ ]]; then
+                if [ -z "${earliest_epoch}" ] || [ "${epoch}" -lt "${earliest_epoch}" ]; then
+                  earliest_epoch=${epoch}
+                  earliest=${!resets_var:-unknown}
+                fi
+              elif [ -z "${earliest_epoch}" ] && [ "${earliest}" = unknown ] \
+                  && [ -n "${!resets_var:-}" ]; then
+                earliest=${!resets_var}
+              fi
+            done
+            if [ "${tried}" = key ]; then
+              summary="The review credential ANTHROPIC_API_KEY is out of quota or rejected, reset ${earliest}."
+            else
+              summary="all review credentials are out of quota or rejected (slots ${tried}), earliest reset ${earliest}"
+            fi
           elif [ "${AGENT_OUTCOME:-}" != "success" ] || [ "${AGENT_CONCLUSION:-}" != "success" ]; then
             # Two independent signals, and both have to say success. The
             # outcome is the step's: `failure` when the agent crashed or
