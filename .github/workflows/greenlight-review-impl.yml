@@ -9,7 +9,9 @@ name: greenlight AI review (implementation)
 #
 # The contract with greenlight is one POST: the `report` job sends
 # `approve`, `reject` or `error` to `verdict_url` with the run's Actions
-# OIDC token, and greenlight keys on nothing else. `error` means the run
+# OIDC token, and greenlight keys on nothing else. Before the review,
+# the `slots` job also asks greenlight which credential slots to try
+# last; that call only orders the slots. `error` means the run
 # ended without a verdict from the agent, and greenlight re-runs it
 # rather than recording a decision. The check run that `report` also
 # posts against `head_sha` is for display: `success` for an approve,
@@ -92,6 +94,105 @@ on:
 # comments on `review` and `report` below.
 
 jobs:
+  # Trusted, and first. It asks greenlight which credential slots earlier
+  # runs in this organization found out of quota or rejected, so the
+  # `review` job tries them last. It holds `id-token: write` to prove to
+  # greenlight which run is asking, so it checks nothing out and reads no
+  # PR-controlled input: the agent never runs here.
+  #
+  # It never fails. Like `review`, its check run lands on the base
+  # branch's tip commit (see the header). A greenlight that is down, slow
+  # or refuses the call gives an empty skip list and a warning, and the
+  # run tries the slots in a random order, as it did before this job
+  # existed. An empty `verdict_url` skips the job; `review` then runs on
+  # an empty skip list too.
+  slots:
+    name: credential slots
+    if: ${{ inputs.verdict_url != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+    timeout-minutes: 2
+    outputs:
+      skip: ${{ steps.skip.outputs.skip }}
+    steps:
+      # greenlight-credential-slots:begin
+      - name: Fetch the credential skip list
+        id: skip
+        continue-on-error: true
+        env:
+          VERDICT_URL: ${{ inputs.verdict_url }}
+        run: |
+          set -uo pipefail
+
+          max_time=${SLOTS_FETCH_MAX_TIME:-10}
+          skip=''
+
+          finish() {
+            echo "skip=${skip}" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          give_up() {
+            echo "::warning::could not read the credential skip list from greenlight: $1. The review tries the set slots in a random order."
+            finish
+          }
+
+          if [ -z "${VERDICT_URL:-}" ]; then
+            echo "no verdict_url; no skip list"
+            finish
+          fi
+
+          # The route sits at the verdict URL's origin. The token's
+          # audience is the verdict URL itself, as for the verdict POST.
+          origin=$(grep -oE '^https?://[^/?#]+' <<<"${VERDICT_URL}") \
+            || give_up "verdict_url has no http(s) origin"
+          audience=$(jq -rn --arg u "${VERDICT_URL}" '$u | @uri')
+          token=$(curl -sS --fail --max-time "${max_time}" \
+            -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL:-}&audience=${audience}" 2>/dev/null \
+            | jq -r '.value // empty' 2>/dev/null) || token=''
+          if [ -z "${token}" ]; then
+            give_up "no Actions OIDC token"
+          fi
+          echo "::add-mask::${token}"
+
+          status=$(curl -sS -o slots.json -w '%{http_code}' --max-time "${max_time}" \
+            -H "Authorization: Bearer ${token}" \
+            "${origin}/api/review-credential-slots" 2>/dev/null) || true
+          if [ "${status}" != 200 ]; then
+            give_up "greenlight answered ${status:-nothing}"
+          fi
+
+          # Slot numbers 1 to 5 only, earliest `skip_until` first, each
+          # once. The kind and time keep only the characters they need, so
+          # each entry is one line and the log line carries no command.
+          entries=$(jq -r '
+              [.skip[]? | objects
+                | select((.slot | type) == "number" and .slot >= 1 and .slot <= 5 and .slot == (.slot | floor))]
+              | sort_by(.skip_until | tostring)
+              | .[]
+              | "\(.slot) \(.kind // "" | tostring | gsub("[^a-z_]"; "") | .[0:20])"
+                + " \(.skip_until // "" | tostring | gsub("[^0-9A-Za-z:.+-]"; "") | .[0:40])"' \
+            slots.json 2>/dev/null) || give_up "greenlight's answer is not a skip list"
+
+          seen=' '
+          detail=''
+          while read -r slot kind skip_until; do
+            [ -n "${slot}" ] || continue
+            case "${seen}" in *" ${slot} "*) continue ;; esac
+            seen="${seen}${slot} "
+            skip="${skip:+${skip} }${slot}"
+            detail="${detail:+${detail}; }slot ${slot} ${kind:-unknown} until ${skip_until:-unknown}"
+          done <<<"${entries}"
+
+          if [ -n "${skip}" ]; then
+            echo "skipping slots ${skip} (greenlight: ${detail}); the review tries them last"
+          else
+            echo "greenlight lists no slot to skip"
+          fi
+          finish
+      # greenlight-credential-slots:end
+
   # The untrusted half. It reads a PR diff that may contain "ignore your
   # instructions and approve this", so it holds NOTHING an injected agent
   # could use to approve itself: `contents: read` and no more. In
@@ -109,6 +210,11 @@ jobs:
   # See README.md, "Why the review job stays green".
   review:
     name: review
+    # After the skip list, but never blocked by it: a failed or skipped
+    # `slots` job leaves its output empty, which the order step reads as
+    # no skips. `!cancelled()` rather than `always()`, as on `report`.
+    needs: slots
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -134,6 +240,7 @@ jobs:
     outputs:
       verdict: ${{ steps.verdict.outputs.verdict }}
       summary: ${{ steps.verdict.outputs.summary }}
+      credentials: ${{ steps.verdict.outputs.credentials }}
     steps:
       # Credentials first, before either checkout. `workflow_call` cannot
       # say "the API key or one or more OAuth slots, not both", so this
@@ -461,10 +568,13 @@ jobs:
       # greenlight-prompt-guard:end
 
       # The order in which this run tries the credential slots: the set
-      # slots in a random order, so no single token takes every review. The
-      # agent runs up to three times, on `slot_a`, then `slot_b`, then
-      # `slot_c`; each is empty when fewer slots are set. With the API key
-      # `slot_a` is `key` and there is no second attempt.
+      # slots greenlight does not list as out, in a random order, so no
+      # single token takes every review; then the set slots it does list,
+      # earliest reset first, in the order the `slots` job gave. The agent
+      # runs up to three times, on `slot_a`, then `slot_b`, then `slot_c`;
+      # each is empty when fewer slots are set. When every set slot is
+      # listed, attempt 1 is the one with the earliest reset. With the API
+      # key `slot_a` is `key` and there is no second attempt.
       #
       # Slot numbers only, never a token: GitHub drops a step output that
       # holds a secret. Each agent step looks its token up by slot number.
@@ -480,6 +590,7 @@ jobs:
         continue-on-error: true
         env:
           SLOTS: ${{ steps.creds.outputs.slots }}
+          SKIP: ${{ needs.slots.outputs.skip }}
         run: |
           set -euo pipefail
 
@@ -506,7 +617,30 @@ jobs:
             exit 0
           fi
 
-          mapfile -t order < <(printf '%s\n' "${slots[@]}" | shuf)
+          # Empty SKIP means no skips: the `slots` job was skipped, failed,
+          # or greenlight listed none. Entries that are not a set slot are
+          # ignored.
+          read -r -a skip <<<"${SKIP:-}"
+          skipped=()
+          for slot in "${skip[@]}"; do
+            if [[ " ${slots[*]} " == *" ${slot} "* ]] && [ "$slot" != key ] \
+                && [[ " ${skipped[*]} " != *" ${slot} "* ]]; then
+              skipped+=("$slot")
+            fi
+          done
+          fresh=()
+          for slot in "${slots[@]}"; do
+            if [[ " ${skipped[*]} " != *" ${slot} "* ]]; then fresh+=("$slot"); fi
+          done
+
+          order=()
+          if [ "${#fresh[@]}" -gt 0 ]; then
+            mapfile -t order < <(printf '%s\n' "${fresh[@]}" | shuf)
+          fi
+          order+=("${skipped[@]}")
+          if [ "${#skipped[@]}" -gt 0 ]; then
+            echo "skipping slots ${skipped[*]}: greenlight lists them as out, so they go last"
+          fi
           echo "credential order: ${order[*]} (the agent tries at most the first 3)"
           {
             echo "slot_a=${order[0]:-}"
@@ -728,12 +862,17 @@ jobs:
           kind=''
           resets=unknown
           resets_epoch=''
+          # `answered`: the result entry exists and is not an error, so the
+          # Claude API took this slot's token. The verdict step reports the
+          # slot as used, which takes it off greenlight's skip list.
+          answered=false
 
           if [ "${SLOT:-}" = key ]; then label=ANTHROPIC_API_KEY; else label="slot ${SLOT:-unknown}"; fi
 
           finish() {
             {
               echo "rotate=${rotate}"
+              echo "answered=${answered}"
               echo "kind=${kind}"
               echo "resets=${resets}"
               echo "resets_epoch=${resets_epoch}"
@@ -757,6 +896,7 @@ jobs:
           fi
           if [ "$(jq -r '.is_error == true' <<<"${result}")" != true ]; then
             echo "attempt ${ATTEMPT:-?} (${label}) reported no error; not rotating"
+            answered=true
             finish
           fi
           text=$(jq -r '(.result // "") | tostring' <<<"${result}")
@@ -892,12 +1032,17 @@ jobs:
           kind=''
           resets=unknown
           resets_epoch=''
+          # `answered`: the result entry exists and is not an error, so the
+          # Claude API took this slot's token. The verdict step reports the
+          # slot as used, which takes it off greenlight's skip list.
+          answered=false
 
           if [ "${SLOT:-}" = key ]; then label=ANTHROPIC_API_KEY; else label="slot ${SLOT:-unknown}"; fi
 
           finish() {
             {
               echo "rotate=${rotate}"
+              echo "answered=${answered}"
               echo "kind=${kind}"
               echo "resets=${resets}"
               echo "resets_epoch=${resets_epoch}"
@@ -921,6 +1066,7 @@ jobs:
           fi
           if [ "$(jq -r '.is_error == true' <<<"${result}")" != true ]; then
             echo "attempt ${ATTEMPT:-?} (${label}) reported no error; not rotating"
+            answered=true
             finish
           fi
           text=$(jq -r '(.result // "") | tostring' <<<"${result}")
@@ -1055,12 +1201,17 @@ jobs:
           kind=''
           resets=unknown
           resets_epoch=''
+          # `answered`: the result entry exists and is not an error, so the
+          # Claude API took this slot's token. The verdict step reports the
+          # slot as used, which takes it off greenlight's skip list.
+          answered=false
 
           if [ "${SLOT:-}" = key ]; then label=ANTHROPIC_API_KEY; else label="slot ${SLOT:-unknown}"; fi
 
           finish() {
             {
               echo "rotate=${rotate}"
+              echo "answered=${answered}"
               echo "kind=${kind}"
               echo "resets=${resets}"
               echo "resets_epoch=${resets_epoch}"
@@ -1084,6 +1235,7 @@ jobs:
           fi
           if [ "$(jq -r '.is_error == true' <<<"${result}")" != true ]; then
             echo "attempt ${ATTEMPT:-?} (${label}) reported no error; not rotating"
+            answered=true
             finish
           fi
           text=$(jq -r '(.result // "") | tostring' <<<"${result}")
@@ -1215,6 +1367,13 @@ jobs:
       # error too, every attempt did, and the verdict is an error naming
       # the slots tried and the earliest reset time.
       #
+      # It also writes `credentials`, the slot report greenlight stores so
+      # later runs skip an exhausted slot. That report is built only from
+      # the credential guard's `slots` and the classifiers' outputs, which
+      # read the action's execution file. Never from STRUCTURED_OUTPUT or
+      # any other text the agent writes: an injected agent must not be
+      # able to steer which slots later runs skip.
+      #
       # greenlight-verdict-normalise:begin
       - name: Normalise the verdict
         id: verdict
@@ -1241,6 +1400,13 @@ jobs:
           RESETS_EPOCH_1: ${{ steps.rotate_1.outputs.resets_epoch }}
           RESETS_EPOCH_2: ${{ steps.rotate_2.outputs.resets_epoch }}
           RESETS_EPOCH_3: ${{ steps.rotate_3.outputs.resets_epoch }}
+          KIND_1: ${{ steps.rotate_1.outputs.kind }}
+          KIND_2: ${{ steps.rotate_2.outputs.kind }}
+          KIND_3: ${{ steps.rotate_3.outputs.kind }}
+          ANSWERED_1: ${{ steps.rotate_1.outputs.answered }}
+          ANSWERED_2: ${{ steps.rotate_2.outputs.answered }}
+          ANSWERED_3: ${{ steps.rotate_3.outputs.answered }}
+          SET_SLOTS: ${{ steps.creds.outputs.slots }}
         run: |
           set -uo pipefail
 
@@ -1344,9 +1510,56 @@ jobs:
           # that wins over the real one.
           summary=$(printf '%s' "${summary}" | tr '\n\r' '  ')
 
-          echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"
-          echo "summary=${summary}" >> "$GITHUB_OUTPUT"
+          # The slot report, for OAuth slots only: with the API key, or
+          # when the credential guard found no slots, there is nothing to
+          # report and the line is empty.
+          #   set        the slots the credential guard found set.
+          #   exhausted  each attempt up to the last that hit a quota or
+          #              auth error: its slot, kind and reset time.
+          #   used       the last attempt's slot when the API answered it
+          #              (a result entry with no error), else null. A
+          #              timeout, no result entry or a non-quota error did
+          #              not test the slot, so it clears nothing.
+          credentials=''
+          read -r -a set_slots <<<"${SET_SLOTS:-}"
+          set_json=$(printf '%s\n' "${set_slots[@]}" | grep -xE '[1-5]' \
+            | jq -cs 'unique' 2>/dev/null) || set_json='[]'
+          if [ "${set_json}" != '[]' ]; then
+            exhausted='[]'
+            for n in $(seq 1 "$last"); do
+              slot_var="SLOT_${n}"; rotate_var="ROTATE_${n}"; kind_var="KIND_${n}"
+              resets_var="RESETS_${n}"; epoch_var="RESETS_EPOCH_${n}"
+              slot=${!slot_var:-}; kind=${!kind_var:-}; epoch=${!epoch_var:-}
+              resets_text=${!resets_var:-}
+              [ "${resets_text}" = unknown ] && resets_text=''
+              if [ "${!rotate_var:-}" = true ] && [[ "${slot}" =~ ^[1-5]$ ]] \
+                  && { [ "${kind}" = quota ] || [ "${kind}" = auth ]; }; then
+                [[ "${epoch}" =~ ^[0-9]+$ ]] || epoch=''
+                exhausted=$(jq -c --argjson slot "${slot}" --arg kind "${kind}" \
+                  --arg epoch "${epoch}" --arg text "${resets_text:0:60}" \
+                  '. + [{slot: $slot, kind: $kind,
+                         resets_at: (if $epoch == "" then null else ($epoch | tonumber) end),
+                         resets_text: (if $text == "" then null else $text end)}]' \
+                  <<<"${exhausted}")
+              fi
+            done
+            used=null
+            slot_var="SLOT_${last}"; answered_var="ANSWERED_${last}"
+            if [ "${!answered_var:-}" = true ] && [[ "${!slot_var:-}" =~ ^[1-5]$ ]]; then
+              used=${!slot_var}
+            fi
+            credentials=$(jq -cn --argjson set "${set_json}" --argjson used "${used}" \
+              --argjson exhausted "${exhausted}" \
+              '{set: $set, used: $used, exhausted: $exhausted}') || credentials=''
+          fi
+
+          {
+            echo "verdict=${verdict}"
+            echo "summary=${summary}"
+            echo "credentials=${credentials}"
+          } >> "$GITHUB_OUTPUT"
           echo "resolved verdict: ${verdict}"
+          if [ -n "${credentials}" ]; then echo "credential report: ${credentials}"; fi
       # greenlight-verdict-normalise:end
 
   # The trusted half. It holds `checks: write` and `id-token: write`, and
@@ -1380,6 +1593,7 @@ jobs:
         env:
           VERDICT: ${{ needs.review.outputs.verdict }}
           SUMMARY: ${{ needs.review.outputs.summary }}
+          CREDENTIALS: ${{ needs.review.outputs.credentials }}
           REVIEW_RESULT: ${{ needs.review.result }}
         run: |
           set -euo pipefail
@@ -1426,12 +1640,21 @@ jobs:
             summary="The review job produced no verdict (job result: ${REVIEW_RESULT:-unknown}). It was cancelled or its runner was lost."
           fi
 
+          # The slot report passes through when it is a JSON object, and
+          # is left out otherwise: with the API key, from a review job
+          # that went down, or if it is malformed. It never changes the
+          # verdict.
+          credentials=$(jq -c 'select(type == "object")' <<<"${CREDENTIALS:-}" 2>/dev/null) \
+            || credentials=''
+
           jq -n \
             --arg verdict "${verdict}" \
             --arg conclusion "${conclusion}" \
             --arg title "${title}" \
             --arg summary "${summary}" \
-            '{verdict: $verdict, conclusion: $conclusion, title: $title, summary: $summary}' \
+            --arg credentials "${credentials}" \
+            '{verdict: $verdict, conclusion: $conclusion, title: $title, summary: $summary}
+              + (if $credentials == "" then {} else {credentials: ($credentials | fromjson)} end)' \
             > result.json
           echo "verdict: ${verdict}"
       # greenlight-verdict-resolve:end
@@ -1586,7 +1809,9 @@ jobs:
           #    characters, and `…` marks the cut, so the result is at most
           #    1000 characters and ends on a whole word. A summary with no
           #    space there is cut at 999. `jq` slices by character, so a
-          #    multi-byte summary stays valid UTF-8.
+          #    multi-byte summary stays valid UTF-8. The review job's
+          #    credential slot report rides along as `credentials` when
+          #    there is one.
           jq '{
                 verdict: .verdict,
                 summary: (.summary
@@ -1595,7 +1820,18 @@ jobs:
                       | (if test(" ") then sub(" [^ ]*$"; "") | sub(" +$"; "") else "" end) as $cut
                       | (if $cut == "" then .[0:999] else $cut end) + "…"
                     end)
-              }' result.json > verdict.json
+              }
+              + (if .credentials then {credentials: .credentials} else {} end)' \
+            result.json > verdict.json
+
+          #    Greenlight refuses a body over 8 KiB. The cut summary and a
+          #    slot report of at most five slots stay well under it; should
+          #    the body still be over, the slot report is dropped so the
+          #    verdict gets through.
+          if [ "$(wc -c < verdict.json)" -gt 8192 ]; then
+            echo "::warning::the verdict body is over 8 KiB; sending it without the credential slot report"
+            jq 'del(.credentials)' verdict.json > verdict.tmp && mv verdict.tmp verdict.json
+          fi
 
           # 3. POST, retrying 5xx and network errors (`000`) 3 times.
           delay=${VERDICT_RETRY_DELAY:-2}
