@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Verify the greenlight AI review workflows without a live dispatch.
 #
-# Eleven things nothing else catches:
+# Twelve things nothing else catches:
 #
 #  1. The permission split. The `review` job must not be able to post a
 #     check run or mint an OIDC token; the `report` job must be able to
@@ -57,8 +57,12 @@
 #     agent runs up to three times, each attempt only after the one before
 #     hit a quota or auth error; the classifier rotates on those errors
 #     and nothing else; and the verdict reads the attempt that ran last.
+# 12. The credential skip list and slot report. A trusted first job asks
+#     greenlight which slots to skip and never fails; the order step tries
+#     those slots last; the verdict POST carries a slot report built only
+#     from the credential guard and the classifiers, never the agent.
 #
-# (3), (4) and (6) to (11) all work the same way: the shell block is lifted out
+# (3), (4) and (6) to (12) all work the same way: the shell block is lifted out
 # of the shipped YAML by its `greenlight-*:begin`/`:end` markers and run
 # here, so these test the code CI runs rather than a copy of it.
 #
@@ -101,6 +105,7 @@ review_diff_snippet="$scratch/review-diff.sh"
 resolve_snippet="$scratch/resolve.sh"
 annotate_snippet="$scratch/annotate.sh"
 post_snippet="$scratch/post.sh"
+slots_snippet="$scratch/slots.sh"
 stub_pid=
 trap '[ -n "$stub_pid" ] && kill "$stub_pid" 2>/dev/null; rm -rf "$scratch"' EXIT
 
@@ -331,6 +336,57 @@ else
   fail "report job must declare 'needs: review'"
 fi
 
+# The `slots` job is trusted: it mints an OIDC token, so it must never
+# see PR content. It holds `id-token: write` and nothing else, checks
+# nothing out, reads no input but `verdict_url`, and runs only when
+# `verdict_url` is set.
+slots_block=$(job_block "$IMPL" slots)
+if [ -z "$slots_block" ]; then
+  fail "impl has no 'slots' job"
+fi
+slots_perms=$(printf '%s\n' "$slots_block" | awk '
+  /^    permissions:$/ { inside = 1; next }
+  inside && /^      / { print; next }
+  inside { inside = 0 }
+')
+if [ "$slots_perms" = "      id-token: write" ]; then
+  ok "slots job declares id-token: write and nothing else"
+else
+  fail "slots job must declare exactly 'id-token: write', got: ${slots_perms:-nothing}"
+fi
+if grep -qE 'uses:|checkout|head_sha|base_ref|pr_number|prompt_path|review_name|check_name|secrets\.' <<<"$slots_block"; then
+  fail "slots job checks something out, uses an action, or reads an input other than verdict_url or a secret; it holds an OIDC token and must see no PR content"
+else
+  ok "slots job checks nothing out and reads only verdict_url"
+fi
+if grep -qxF "    if: \${{ inputs.verdict_url != '' }}" <<<"$slots_block" \
+    && grep -qx '    timeout-minutes: 2' <<<"$slots_block" \
+    && grep -qx '        continue-on-error: true' <<<"$slots_block" \
+    && grep -qF -- '--max-time "${max_time}"' <<<"$slots_block" \
+    && grep -qF 'max_time=${SLOTS_FETCH_MAX_TIME:-10}' <<<"$slots_block"; then
+  ok "slots job runs only with a verdict_url, within 2 minutes, with 10-second calls that cannot fail it"
+else
+  fail "slots job must carry 'if: \${{ inputs.verdict_url != '' }}', 'timeout-minutes: 2', a continue-on-error step, and curl --max-time of 10 seconds"
+fi
+if grep -qE '^ *exit [1-9]' <<<"$slots_block"; then
+  fail "slots job exits non-zero somewhere; like review, its check run lands on the base branch's tip commit"
+else
+  ok "slots job never exits non-zero"
+fi
+
+# `review` waits for the skip list but is never blocked by it.
+if grep -qx '    needs: slots' <<<"$review_block" && grep -qxF '    if: ${{ !cancelled() }}' <<<"$review_block"; then
+  ok "review job needs slots and runs when slots failed or was skipped"
+else
+  fail "review job must declare 'needs: slots' and 'if: \${{ !cancelled() }}', so a failed or skipped slots job never blocks the review"
+fi
+if grep -qxF '          SKIP: ${{ needs.slots.outputs.skip }}' <<<"$review_block" \
+    && grep -qxF '      skip: ${{ steps.skip.outputs.skip }}' <<<"$slots_block"; then
+  ok "the order step reads the slots job's skip output"
+else
+  fail "the slots job must output 'skip' and the order step must read it as SKIP"
+fi
+
 if grep -q 'claude-opus-5' "$IMPL"; then
   ok "impl pins the model to claude-opus-5"
 else
@@ -511,6 +567,15 @@ if [ -n "$agent_timeout" ] && [ -n "$job_timeout" ] && [ "$agent_timeout" = "${b
   ok "agent budget (${budget}m) = attempt 1's cap < review job cap (${job_timeout}m) < greenlight's 20m dispatch timeout"
 else
   fail "attempt 1's timeout (${agent_timeout:-none}) must equal AGENT_BUDGET_MINUTES in the order step (${budget:-none}) and be under the review job's (${job_timeout:-none}), which must be under greenlight's 20-minute dispatch timeout"
+fi
+
+# The `slots` job runs before `review`, so the two caps together have to
+# stay under greenlight's dispatch timeout.
+slots_timeout=$(job_block "$IMPL" slots | sed -n 's/^    timeout-minutes: \([0-9]*\)$/\1/p' | head -1)
+if [ -n "$slots_timeout" ] && [ -n "$job_timeout" ] && [ $((slots_timeout + job_timeout)) -lt 20 ]; then
+  ok "slots job cap (${slots_timeout}m) + review job cap (${job_timeout}m) < greenlight's 20m dispatch timeout"
+else
+  fail "the slots job's cap (${slots_timeout:-none}) and the review job's (${job_timeout:-none}) must add up to under greenlight's 20-minute dispatch timeout"
 fi
 
 for n in 2 3; do
@@ -1007,12 +1072,12 @@ else
 fi
 
 run_order() {
-  local slots=$1
+  local slots=$1 skip=${2:-}
   order_out="$scratch/order-out"
   order_env="$scratch/order-env"
   : > "$order_out"
   : > "$order_env"
-  SLOTS="$slots" GITHUB_OUTPUT="$order_out" GITHUB_ENV="$order_env" \
+  SLOTS="$slots" SKIP="$skip" GITHUB_OUTPUT="$order_out" GITHUB_ENV="$order_env" \
     bash "$order_snippet" >/dev/null 2>&1
 }
 order_output() { sed -n "s/^$1=//p" "$order_out"; }
@@ -1072,6 +1137,47 @@ if run_order key && [ "$(order_output slot_a)" = key ] && [ -z "$(order_output s
 else
   fail "order step for the API key wrote: $(cat "$order_out")"
 fi
+
+# The skip list from the `slots` job. Skipped slots go last, in the
+# order greenlight gave (earliest reset first), after the others shuffled.
+# Every set slot skipped still gives three attempts, earliest reset first.
+# A skipped slot that is not set, or not a slot, is ignored.
+#
+# set slots | skip | expected slot_a slot_b slot_c, `*` for any unskipped slot | case label
+skip_cases=(
+  "1 2 3|3 1|2 3 1|two of three slots skipped"
+  "1 2 3|2 1 3|2 1 3|every slot skipped"
+  "1 2 3 4 5|5 1|* * *|two of five skipped, so three unskipped slots fill the attempts"
+  "2 4|5 4|2 4 |a skipped slot that is not set"
+  "1 2|x 9 1 1|2 1 |junk and a repeat in the skip list"
+  "1 2 3||* * *|an empty skip list"
+  "key|1|key  |the API key, which nothing skips"
+)
+for case in "${skip_cases[@]}"; do
+  IFS='|' read -r slots skip want label <<<"$case"
+  if ! run_order "$slots" "$skip"; then
+    fail "order step exited non-zero for ${label}"
+    continue
+  fi
+  got="$(order_output slot_a) $(order_output slot_b) $(order_output slot_c)"
+  if [[ "$want" == *'*'* ]]; then
+    bad=''
+    for p in $got; do
+      if [[ " ${skip} " == *" ${p} "* ]] || [[ " ${slots} " != *" ${p} "* ]]; then bad="${bad} ${p}"; fi
+    done
+    picked=$(wc -w <<<"$got")
+    want_count=$(wc -w <<<"$slots"); [ "$want_count" -gt 3 ] && want_count=3
+    if [ -z "$bad" ] && [ "$picked" -eq "$want_count" ]; then
+      ok "order step tries only unskipped slots first for ${label} (${got})"
+    else
+      fail "order step gave '${got}' for ${label}; skipped or unset:${bad}"
+    fi
+  elif [ "$got" = "$want" ] && [ ! -s "$order_env" ]; then
+    ok "order step gives '${want}' for ${label}"
+  else
+    fail "order step gave '${got}', expected '${want}', for ${label}: $(cat "$order_env")"
+  fi
+done
 
 budget_seconds=$(( ${budget:-14} * 60 ))
 now=$(date +%s)
@@ -1419,8 +1525,10 @@ for case in "${cases[@]}"; do
 
   # An agent-controlled summary must never smuggle a second key=value
   # line into $GITHUB_OUTPUT.
-  if [ "$(grep -c '^verdict=' "$out")" -ne 1 ] || [ "$(wc -l <"$out")" -ne 2 ]; then
-    fail "verdict block wrote more than the two expected output lines for ${label}"
+  # No slot report without the credential guard's slots.
+  if [ "$(grep -c '^verdict=' "$out")" -ne 1 ] || [ "$(wc -l <"$out")" -ne 3 ] \
+      || [ "$(grep -cx 'credentials=' "$out")" -ne 1 ]; then
+    fail "verdict block wrote other than its three expected output lines for ${label}: $(cat "$out")"
   fi
 
   # The summary reaches the report job as a jq --arg, so it has to stay
@@ -1743,8 +1851,20 @@ for case in "${rotate_cases[@]}"; do
   if grep -qF "$TRANSCRIPT_SECRET" <<<"$out" || grep -qiE 'api error|invalid api key|maximum number' <<<"$out"; then
     fail "classifier printed the error or transcript text for ${label}: ${out}"
   fi
-  if [ "$(grep -c '^rotate=' "$rotate_out")" -ne 1 ] || [ "$(wc -l <"$rotate_out")" -ne 6 ]; then
-    fail "classifier wrote other than its six output lines for ${label}: $(cat "$rotate_out")"
+  if [ "$(grep -c '^rotate=' "$rotate_out")" -ne 1 ] || [ "$(wc -l <"$rotate_out")" -ne 7 ]; then
+    fail "classifier wrote other than its seven output lines for ${label}: $(cat "$rotate_out")"
+  fi
+
+  # `answered` only for a result entry that is not an error: the API took
+  # the slot's token, whatever the result text says.
+  case "$file" in
+    clean.json|quota-in-clean.json) want_answered=true ;;
+    *) want_answered=false ;;
+  esac
+  if [ "$(sed -n 's/^answered=//p' "$rotate_out")" = "$want_answered" ]; then
+    ok "classifier gives answered=${want_answered} for ${label}"
+  else
+    fail "classifier gave answered '$(sed -n 's/^answered=//p' "$rotate_out")', expected ${want_answered}, for ${label}"
   fi
 done
 
@@ -1760,6 +1880,89 @@ if [ "$(sed -n 's/^minutes_left=//p' "$rotate_out")" = 7 ]; then
 else
   fail "classifier gave minutes_left '$(sed -n 's/^minutes_left=//p' "$rotate_out")' with 7.5 minutes left, expected 7"
 fi
+
+## 4f. The credential slot report: each attempt's execution file run
+## through the classifier, and the classifier's outputs through the
+## verdict step, both extracted from the YAML.
+
+# The verdict step reads every source of the report from step outputs:
+# the guard's set slots and each classifier's rotate, answered, kind and
+# reset time.
+normalise_block=$(step_block 'Normalise the verdict')
+for n in 1 2 3; do
+  for pair in "ROTATE:rotate" "ANSWERED:answered" "KIND:kind" "RESETS:resets" "RESETS_EPOCH:resets_epoch"; do
+    want="          ${pair%%:*}_${n}: \${{ steps.rotate_${n}.outputs.${pair#*:} }}"
+    if ! grep -qxF "$want" <<<"$normalise_block"; then
+      fail "the verdict step must read '${want# *}'"
+    fi
+  done
+done
+if grep -qxF '          SET_SLOTS: ${{ steps.creds.outputs.slots }}' <<<"$normalise_block"; then
+  ok "the verdict step reads the guard's set slots and every classifier output the report needs"
+else
+  fail "the verdict step must read 'SET_SLOTS: \${{ steps.creds.outputs.slots }}'"
+fi
+if grep -qxF '      credentials: ${{ steps.verdict.outputs.credentials }}' <<<"$review_block" \
+    && grep -qxF '          CREDENTIALS: ${{ needs.review.outputs.credentials }}' <<<"$report_block"; then
+  ok "the slot report passes from the review job's outputs to the report job"
+else
+  fail "the review job must output 'credentials' and the resolve step must read it as CREDENTIALS"
+fi
+
+# Set slots | attempts as slot:fixture:step outcome, comma-separated |
+# structured output of the last attempt | expected credentials JSON, or
+# empty for none | case label
+quota_text='Nov 3, 5pm (America/New_York)'
+cred_cases=(
+  "1 3|1:resets.json:failure,3:clean.json:success|{\"verdict\":\"approve\",\"summary\":\"Fine.\"}|{\"set\":[1,3],\"used\":3,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"${quota_text}\"}]}|slot 1 out of quota, then slot 3 approves"
+  "1 2 4 5|4:epoch.json:failure,1:auth401.json:failure,2:session.json:failure||{\"set\":[1,2,4,5],\"used\":null,\"exhausted\":[{\"slot\":4,\"kind\":\"quota\",\"resets_at\":1761955200,\"resets_text\":\"${epoch_text}\"},{\"slot\":1,\"kind\":\"auth\",\"resets_at\":null,\"resets_text\":null},{\"slot\":2,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"3pm\"}]}|all three attempts rotate"
+  "1 2|1:resets.json:failure,2:no-result.json:failure||{\"set\":[1,2],\"used\":null,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"${quota_text}\"}]}|slot 1 out of quota, then slot 2 times out with no result"
+  "2|2:other.json:failure||{\"set\":[2],\"used\":null,\"exhausted\":[]}|slot 2 ends on an error that is not quota or auth"
+  "1 2|2:clean.json:success|{\"verdict\":\"reject\",\"summary\":\"x\\ncredentials={\\\"used\\\":1}\",\"credentials\":{\"used\":1,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\"}]}}|{\"set\":[1,2],\"used\":2,\"exhausted\":[]}|an agent that writes its own credentials"
+  "key|key:clean.json:success|{\"verdict\":\"approve\"}||the API key"
+)
+for case in "${cred_cases[@]}"; do
+  IFS='|' read -r set_slots attempts structured want label <<<"$case"
+  IFS=',' read -r -a steps <<<"$attempts"
+  env_args=("SET_SLOTS=${set_slots}")
+  n=0
+  for step in "${steps[@]}"; do
+    n=$((n + 1))
+    IFS=':' read -r slot fixture outcome <<<"$step"
+    suffix="_${n}"
+    [ "$n" = 1 ] && suffix=''
+    rotate_out="$scratch/rotate-out"
+    : > "$rotate_out"
+    ATTEMPT=$n EXECUTION_FILE="$rotate_dir/$fixture" SLOT="$slot" NEXT_SLOT=9 \
+      DEADLINE=$(( $(date +%s) + 600 )) GITHUB_OUTPUT="$rotate_out" \
+      bash "$rotate_snippet" >/dev/null 2>&1 || true
+    for name in rotate answered kind resets resets_epoch; do
+      upper=$(tr '[:lower:]' '[:upper:]' <<<"$name")
+      env_args+=("${upper}_${n}=$(sed -n "s/^${name}=//p" "$rotate_out")")
+    done
+    env_args+=("SLOT_${n}=${slot}" "AGENT_OUTCOME${suffix}=${outcome}" "AGENT_CONCLUSION${suffix}=${outcome}")
+    if [ "$n" = "${#steps[@]}" ]; then
+      env_args+=("STRUCTURED_OUTPUT${suffix}=${structured}")
+    fi
+  done
+
+  out="$scratch/cred-normalise"
+  : > "$out"
+  if ! env -u REVIEW_FATAL "${env_args[@]}" GITHUB_OUTPUT="$out" bash "$verdict_snippet" >/dev/null 2>&1; then
+    fail "verdict block exited non-zero for ${label}"
+    continue
+  fi
+  got=$(sed -n 's/^credentials=//p' "$out")
+  if [ "$(grep -c '^credentials=' "$out")" -ne 1 ] || [ "$(wc -l <"$out")" -ne 3 ]; then
+    fail "verdict block wrote other than its three output lines for ${label}: $(cat "$out")"
+  elif [ -z "$want" ] && [ -z "$got" ]; then
+    ok "no slot report for ${label}"
+  elif [ -n "$want" ] && [ -n "$got" ] && jq -e --argjson want "$want" '. == $want' <<<"$got" >/dev/null 2>&1; then
+    ok "slot report for ${label}: ${got}"
+  else
+    fail "slot report for ${label} is '${got}', expected '${want}'"
+  fi
+done
 
 ## 4d. The git root, extracted from the YAML and executed.
 
@@ -1882,6 +2085,37 @@ for case in "${resolve_cases[@]}"; do
   fi
 done
 
+# The slot report passes into result.json when it is a JSON object, and
+# is left out otherwise. It never changes the verdict.
+#
+# CREDENTIALS | expected .credentials in result.json, `none` for absent | case label
+report='{"set":[1,3],"used":3,"exhausted":[{"slot":1,"kind":"quota","resets_at":null,"resets_text":"5pm"}]}'
+resolve_cred_cases=(
+  "${report}|${report}|a slot report"
+  "|none|no slot report, as with the API key"
+  "not json|none|a malformed slot report"
+  "[1,2]|none|a slot report that is not an object"
+)
+for case in "${resolve_cred_cases[@]}"; do
+  IFS='|' read -r creds want label <<<"$case"
+  work="$scratch/resolve-work"
+  rm -rf "$work"
+  mkdir -p "$work"
+  if ! (cd "$work" && VERDICT=approve SUMMARY=Fine. CREDENTIALS="$creds" REVIEW_RESULT=success \
+      bash "$resolve_snippet" >/dev/null 2>&1); then
+    fail "resolve step exited non-zero for ${label}"
+    continue
+  fi
+  got=$(jq -c '.credentials // "none"' "$work/result.json")
+  [ "$got" = '"none"' ] && got=none
+  if [ "$(jq -r .verdict "$work/result.json")" = approve ] \
+      && { [ "$got" = "$want" ] || { [ "$want" != none ] && jq -e --argjson w "$want" '.credentials == $w' "$work/result.json" >/dev/null; }; }; then
+    ok "resolve step carries credentials=${want} for ${label}"
+  else
+    fail "resolve step gave credentials '${got}', expected '${want}', for ${label}"
+  fi
+done
+
 # The escaping. The summary is agent-controlled; the review name comes
 # from the repo's config. A `%`, CR or LF must not end the command, and a
 # `:` or `,` in the title must not end the property.
@@ -1979,7 +2213,7 @@ fi
 ## 5. The verdict POST, extracted from the YAML and executed.
 
 # A stub on 127.0.0.1 plays both ends: the Actions token endpoint and
-# Greenlight's verdict route. Each case writes the statuses the route
+# Greenlight's verdict route, and in section 6 its skip-list route. Each case writes the statuses the route
 # answers with, in order; `0` drops the connection with no reply, which
 # curl reports as `000`, the same as any network error. The stub logs
 # every verdict request it gets, so the case can count the retries and
@@ -1995,7 +2229,7 @@ fi
 stub_dir="$scratch/stub"
 mkdir -p "$stub_dir"
 cat > "$stub_dir/stub.py" <<'PY'
-import http.server, json, os, sys, urllib.parse
+import http.server, json, os, sys, time, urllib.parse
 
 d = sys.argv[1]
 TOKEN = "stub-oidc-token-do-not-print"
@@ -2017,6 +2251,27 @@ class H(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
         q = urllib.parse.parse_qs(u.query)
+        if u.path == "/api/review-credential-slots":
+            # The file `slots_reply` holds the status, or `sleep` to answer
+            # too late, then the body.
+            with open(os.path.join(d, "slot_requests"), "a") as f:
+                f.write(json.dumps({"path": self.path, "auth": self.headers.get("Authorization")}) + "\n")
+            status, _, body = open(os.path.join(d, "slots_reply")).read().partition("\n")
+            if self.headers.get("Authorization") != "Bearer " + TOKEN:
+                return self.reply(401, {"error": "bad token", "status": 401})
+            if status == "sleep":
+                time.sleep(3)
+                status = "200"
+            data = body.encode()
+            try:
+                self.send_response(int(status))
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            except OSError:
+                pass
+            return
         want_aud = open(os.path.join(d, "audience")).read()
         if (u.path != "/token"
                 or q.get("api-version") != ["2.0"]
@@ -2185,6 +2440,57 @@ for case in "${post_cases[@]}"; do
   fi
 done
 
+# The slot report rides along as `credentials`, and the body stays under
+# greenlight's 8 KiB cap. The largest real report (five set slots, three
+# exhausted with 60-character reset texts) beside the worst summary the
+# cut allows: 1000 control characters that JSON writes as `\u0001`, six
+# bytes each. A report big enough to pass the cap is dropped, with a
+# warning, and the verdict still goes.
+big_text=$(printf 'r%.0s' $(seq 1 60))
+max_report=$(jq -cn --arg t "$big_text" '{set: [1,2,3,4,5], used: null,
+  exhausted: [range(1; 4) | {slot: ., kind: "quota", resets_at: 1761955200, resets_text: $t}]}')
+worst_summary=$(printf '\001%.0s' $(seq 1 1500))
+huge_report=$(jq -cn --arg t "$(printf 'z%.0s' $(seq 1 9000))" '{set: [1], used: 1, exhausted: [], pad: $t}')
+# summary | credentials | expect credentials sent | case label
+cred_post_cases=(
+  "Fine.|${report}|yes|a slot report"
+  "WORST|${max_report}|yes|the largest slot report beside the worst summary"
+  "Fine.|${huge_report}|no|a slot report that would pass 8 KiB"
+)
+for case in "${cred_post_cases[@]}"; do
+  IFS='|' read -r summary creds want_sent label <<<"$case"
+  [ "$summary" = WORST ] && summary=$worst_summary
+  work="$scratch/post-work"
+  rm -rf "$work"
+  mkdir -p "$work"
+  echo 204 > "$stub_dir/statuses"
+  : > "$stub_dir/requests"
+  jq -n --arg s "$summary" --argjson c "$creds" \
+    '{verdict: "approve", conclusion: "success", title: "t", summary: $s, credentials: $c}' > "$work/result.json"
+  set +e
+  out=$(cd "$work" && VERDICT_URL="$verdict_url" VERDICT_RETRY_DELAY=0 \
+    ACTIONS_ID_TOKEN_REQUEST_URL="$stub/token?api-version=2.0" \
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN=stub-request-token \
+    bash "$post_snippet" 2>&1)
+  status=$?
+  set -e
+  sent=$(tail -1 "$stub_dir/requests" | jq -r .body)
+  bytes=$(printf '%s' "$sent" | wc -c)
+  if [ "$status" -ne 0 ] || [ "$(jq -r .verdict <<<"$sent")" != approve ]; then
+    fail "verdict POST with ${label} exited ${status} and sent '${sent:0:200}': ${out}"
+  elif [ "$bytes" -gt 8192 ]; then
+    fail "verdict POST with ${label} sent ${bytes} bytes, over greenlight's 8 KiB cap"
+  elif [ "$want_sent" = yes ] && jq -e --argjson c "$creds" '.credentials == $c' <<<"$sent" >/dev/null \
+      && [ "$(jq -r 'keys | join(",")' <<<"$sent")" = "credentials,summary,verdict" ]; then
+    ok "verdict POST sends {verdict, summary, credentials} in ${bytes} bytes for ${label}"
+  elif [ "$want_sent" = no ] && [ "$(jq -r 'keys | join(",")' <<<"$sent")" = "summary,verdict" ] \
+      && grep -qF '::warning::the verdict body is over 8 KiB' <<<"$out"; then
+    ok "verdict POST drops the slot report, warns and still sends the verdict for ${label}"
+  else
+    fail "verdict POST with ${label} sent '${sent:0:300}' (${bytes} bytes): ${out}"
+  fi
+done
+
 # No token permission: the job fails, names the missing permission, and
 # sends nothing.
 work="$scratch/post-work"
@@ -2206,6 +2512,106 @@ if out=$(cd "$work" && VERDICT_URL='' bash "$post_snippet" 2>&1) && [ ! -s "$stu
   ok "verdict POST with an empty verdict_url sends nothing and exits 0"
 else
   fail "verdict POST with an empty verdict_url did something: ${out}"
+fi
+
+## 6. The credential skip list, extracted from the YAML and executed.
+
+# The `slots` job asks the stub's skip-list route at the verdict URL's
+# origin, with an OIDC token for the verdict URL's audience, and writes
+# `skip` as the slot numbers ordered by `skip_until`. Every failure gives
+# an empty `skip` and one warning, and the step always exits 0.
+
+extract_run_block "$IMPL" greenlight-credential-slots > "$slots_snippet"
+if [ ! -s "$slots_snippet" ]; then
+  fail "could not extract the credential-slots block from $IMPL"
+  exit 1
+fi
+
+two_entries='{"skip":[{"slot":4,"kind":"auth","skip_until":"2026-11-04T09:00:00Z"},{"slot":1,"kind":"quota","skip_until":"2026-11-03T17:00:00Z"}]}'
+junk_entries='{"skip":[{"slot":9,"kind":"quota","skip_until":"2026-11-03T17:00:00Z"},{"slot":"2"},{"slot":1.5},"slot 3",{"slot":5,"kind":"quota\n::error::x","skip_until":"2026-11-05T00:00:00Z"},{"slot":5,"kind":"auth","skip_until":"2026-11-06T00:00:00Z"}]}'
+# reply status, or `sleep` | reply body | token source | expected skip | warns | case label
+slots_cases=(
+  "200|${two_entries}|yes|1 4|no|two entries, ordered by skip_until"
+  '200|{"skip":[]}|yes||no|an empty skip list'
+  '404|{"error":"no such run","status":404}|yes||yes|a 404'
+  '503|{"error":"down","status":503}|yes||yes|a 503'
+  'sleep|{"skip":[{"slot":2,"kind":"quota","skip_until":"2026-11-03T17:00:00Z"}]}|yes||yes|a reply after the timeout'
+  '200|not json|yes||yes|a body that is not JSON'
+  "200|${junk_entries}|yes|5|no|entries that are not slots, and a repeat"
+  "200|${two_entries}|no||yes|no OIDC token"
+)
+for case in "${slots_cases[@]}"; do
+  IFS='|' read -r reply body token want warns label <<<"$case"
+  work="$scratch/slots-work"
+  rm -rf "$work"
+  mkdir -p "$work"
+  printf '%s\n%s' "$reply" "$body" > "$stub_dir/slots_reply"
+  : > "$stub_dir/slot_requests"
+  : > "$work/output"
+  token_env=()
+  if [ "$token" = yes ]; then
+    token_env=(ACTIONS_ID_TOKEN_REQUEST_URL="$stub/token?api-version=2.0" ACTIONS_ID_TOKEN_REQUEST_TOKEN=stub-request-token)
+  fi
+  started=$(date +%s)
+  set +e
+  out=$(cd "$work" && env "${token_env[@]}" VERDICT_URL="$verdict_url" SLOTS_FETCH_MAX_TIME=1 \
+    GITHUB_OUTPUT="$work/output" bash "$slots_snippet" 2>&1)
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ]; then
+    fail "slots step exited ${status} for ${label}: ${out}"
+    continue
+  fi
+  if [ "$(cat "$work/output")" = "skip=${want}" ]; then
+    ok "slots step gives skip='${want}' for ${label}"
+  else
+    fail "slots step wrote '$(cat "$work/output")', expected 'skip=${want}', for ${label}"
+  fi
+  warnings=$(grep -c '^::warning::' <<<"$out" || true)
+  if { [ "$warns" = yes ] && [ "$warnings" -eq 1 ]; } || { [ "$warns" = no ] && [ "$warnings" -eq 0 ]; }; then
+    ok "slots step prints ${warnings} warning(s) for ${label}"
+  else
+    fail "slots step printed ${warnings} warning(s) for ${label}, expected warns=${warns}: ${out}"
+  fi
+  if grep -v '^::add-mask::' <<<"$out" | grep -qF stub-oidc-token-do-not-print \
+      || grep -c '^::' <<<"$out" | grep -qvE '^[0-2]$' || grep -q '^::error::' <<<"$out"; then
+    fail "slots step printed the token or a stray workflow command for ${label}: ${out}"
+  fi
+  if [ "$(( $(date +%s) - started ))" -gt 4 ]; then
+    fail "slots step took more than 4 seconds for ${label}: it must honour the curl time limit"
+  fi
+  if [ "$token" = yes ]; then
+    requests=$(wc -l <"$stub_dir/slot_requests")
+    if [ "$requests" -eq 1 ] \
+        && [ "$(jq -r .path "$stub_dir/slot_requests")" = /api/review-credential-slots ] \
+        && [ "$(jq -r .auth "$stub_dir/slot_requests")" = "Bearer stub-oidc-token-do-not-print" ]; then
+      ok "slots step sends one GET with the OIDC token to the verdict URL's origin for ${label}"
+    else
+      fail "slots step sent ${requests} request(s) for ${label}: $(cat "$stub_dir/slot_requests")"
+    fi
+  elif [ -s "$stub_dir/slot_requests" ]; then
+    fail "slots step asked greenlight without a token for ${label}"
+  fi
+done
+
+if grep -qxF 'skipping slots 1 4 (greenlight: slot 1 quota until 2026-11-03T17:00:00Z; slot 4 auth until 2026-11-04T09:00:00Z); the review tries them last' \
+    <<<"$(cd "$work" && printf '200\n%s' "$two_entries" > "$stub_dir/slots_reply" \
+      && ACTIONS_ID_TOKEN_REQUEST_URL="$stub/token?api-version=2.0" ACTIONS_ID_TOKEN_REQUEST_TOKEN=stub-request-token \
+      VERDICT_URL="$verdict_url" GITHUB_OUTPUT=/dev/null bash "$slots_snippet" 2>&1)"; then
+  ok "slots step logs the slots it skips and until when"
+else
+  fail "slots step does not log 'skipping slots 1 4 (greenlight: …)'"
+fi
+
+# No verdict_url: no request, no warning, an empty skip list. The job's
+# `if:` skips it in CI already; this is the block's own guard.
+: > "$stub_dir/slot_requests"
+: > "$work/output"
+out=$(cd "$work" && VERDICT_URL='' GITHUB_OUTPUT="$work/output" bash "$slots_snippet" 2>&1) || true
+if [ "$(cat "$work/output")" = "skip=" ] && [ ! -s "$stub_dir/slot_requests" ] && ! grep -q '^::' <<<"$out"; then
+  ok "slots step with an empty verdict_url asks nothing and gives an empty skip list"
+else
+  fail "slots step with an empty verdict_url did something: ${out}"
 fi
 
 kill "$stub_pid" 2>/dev/null || true

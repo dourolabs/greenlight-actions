@@ -13,9 +13,9 @@ the `v2` tag moves.
 
 The greenlight server that dispatches this workflow lives in
 `dourolabs/prototypes`, which is **private**. Nothing here needs it: the
-workflow's whole interface is the seven dispatch inputs, the one check
-run and the one verdict POST described below, and this README is written
-to stand alone.
+workflow's whole interface is the seven dispatch inputs, the one
+skip-list call, the one check run and the one verdict POST described
+below, and this README is written to stand alone.
 
 ## Contents
 
@@ -50,6 +50,11 @@ shows at the top of the run page as an annotation —
 `Greenlight <review>: approved` as a notice, `rejected` or `errored` as
 a warning — and in the `report` job's summary.
 
+Before the review, the `slots` job makes one more call: a `GET` of
+greenlight's skip list, to learn which credential slots to try last. That
+call only orders the slots. Its answer never reaches the verdict, and a
+failed call leaves the order random. See [The skip-list call](#the-skip-list-call).
+
 The workflow posts no PR comments at all. The job that runs the agent
 holds a read-only token by design (see below), so the agent has nothing
 to comment with.
@@ -69,8 +74,10 @@ after it posts the check run, when the `verdict_url` input is non-empty:
    check run keeps the full summary.
 3. It POSTs `{"verdict": "approve" | "reject" | "error", "summary": "…"}`
    to `verdict_url` with `Authorization: Bearer <token>`. The verdict
-   and summary are the ones the check run shows. A `5xx` or a network
-   error is retried 3 times, with a 2, 4 and 8 second backoff.
+   and summary are the ones the check run shows. With OAuth slots the
+   body also carries `credentials`, the run's slot report (below). A
+   `5xx` or a network error is retried 3 times, with a 2, 4 and 8 second
+   backoff.
 4. It keys on the status alone:
 
 | Status | `report` job |
@@ -80,6 +87,57 @@ after it posts the check run, when the `verdict_url` input is non-empty:
 | anything else | Fails, and prints greenlight's `error` text. |
 
 The token is masked in the log and never printed.
+
+The slot report tells greenlight which slots this run found out of
+quota or rejected, and which one worked:
+
+```json
+{"verdict": "approve", "summary": "…",
+ "credentials": {
+   "set": [1, 2, 3],
+   "used": 3,
+   "exhausted": [{"slot": 1, "kind": "quota", "resets_at": null, "resets_text": "5pm (Etc/UTC)"}]
+ }}
+```
+
+| Field | Value |
+| --- | --- |
+| `set` | The slots the credential guard found set in this run. |
+| `used` | The last attempt's slot when the Claude API answered it (a result entry with `is_error` not true), else `null`. A timeout, no result entry or an error that is not quota or auth tested nothing, so it clears nothing. |
+| `exhausted` | One entry per attempt that hit a quota or auth error: `slot` 1 to 5, `kind` `quota` or `auth`, `resets_at` in unix seconds or `null`, `resets_text` the reset text from the error, at most 60 characters, or `null`. |
+
+The `review` job builds the report only from the credential guard's
+output and the classifier steps, which read the action's execution file.
+It never reads the agent's structured output or summary, so an injected
+agent cannot choose which slots later runs skip. The API key sends no
+`credentials`. Greenlight stores the report for approve, reject and error
+alike, and a bad report never changes how it handles the verdict. The
+body stays under greenlight's 8 KiB cap: should it pass it, the report is
+dropped with a warning and the verdict is sent alone.
+
+### The skip-list call
+
+The `slots` job runs first, when `verdict_url` is set. It requests an
+OIDC token whose audience is `verdict_url`, as the verdict POST does, and
+calls `GET <verdict_url origin>/api/review-credential-slots` with it,
+with a 10-second limit:
+
+```
+200 {"skip": [{"slot": 1, "kind": "quota", "skip_until": "2026-11-03T17:00:00Z"}]}
+```
+
+Greenlight answers with the slots that runs in the same organization
+reported out, until their `skip_until`. The job outputs their numbers,
+earliest `skip_until` first, and logs them:
+
+```
+skipping slots 1 4 (greenlight: slot 1 quota until 2026-11-03T17:00:00Z; slot 4 auth until 2026-11-04T09:00:00Z); the review tries them last
+```
+
+Any failure — no token, a timeout, a status other than `200`, a body
+that is not a skip list — gives an empty list and one warning. The job
+never fails, and the `review` job runs whether it succeeded, failed or
+was skipped.
 
 There is no fallback for a greenlight server that does not accept
 `error`: `v2` moves to a workflow that sends it only after the server
@@ -149,15 +207,19 @@ verdict.
    `greenlight-review-impl.yml` and passes `ANTHROPIC_API_KEY` and
    the five OAuth token slots `CLAUDE_CODE_OAUTH_TOKEN` and
    `CLAUDE_CODE_OAUTH_TOKEN_2` to `_5` by name under `secrets:`.
-3. The `review` job checks out the base ref and the head sha into
+3. The `slots` job asks greenlight which credential slots to try last
+   (see [The skip-list call](#the-skip-list-call)). It holds
+   `id-token: write` and nothing else, and checks nothing out.
+4. The `review` job checks out the base ref and the head sha into
    separate directories, writes the PR diff to `./review/` (see
    [What the agent sees](#what-the-agent-sees)), composes the prompt from
    the **base** checkout, runs the agent, and emits a verdict as a job
    output. It resolves every failure it knows about into an `error`
    verdict rather than failing — see [Why the review job stays green](#why-the-review-job-stays-green).
-4. The `report` job reads that output, shows the verdict on the run
+   With OAuth slots it also emits the slot report.
+5. The `report` job reads those outputs, shows the verdict on the run
    page, posts the check run, and, when `verdict_url` is set, POSTs the
-   verdict to greenlight.
+   verdict and the slot report to greenlight.
 
 `workflow_dispatch` cannot trigger a `workflow_call`-only reusable
 workflow, which is why the thin caller exists at all. It carries no
@@ -298,10 +360,15 @@ re-dispatchable — but it is not self-healing.
 ### Credential rotation
 
 With OAuth slots, each run tries them in a random order, so no single
-token takes every review:
+token takes every review, and tries last the slots that earlier runs
+found out:
 
-1. A step shuffles the set slots and picks up to three: `slot_a`,
-   `slot_b`, `slot_c`.
+1. A step shuffles the set slots that greenlight's skip list does not
+   name, then appends the set slots it does name, earliest reset first.
+   It picks the first three: `slot_a`, `slot_b`, `slot_c`. When every
+   set slot is on the skip list, the run still tries them, earliest reset
+   first, rather than failing at once. An empty skip list, as when
+   greenlight did not answer, leaves the plain shuffle.
 2. The agent runs on `slot_a`. If it fails with a **quota or auth
    error** — a usage limit, a quota or rate limit (429), or a 401, an
    invalid, revoked or expired token — the agent runs again on the next
@@ -323,6 +390,12 @@ The reset time is read from the error text when it carries one, and is
 review errors with "all review credentials are out of quota or rejected
 (slots 3 1 4), earliest reset <time>". With the API key there is one
 attempt and no rotation.
+
+Each run reports what it found in the verdict POST's `credentials`, and
+greenlight keeps that state per organization: a slot out of quota is
+skipped until its reported reset (at most 8 days; 6 hours when the error
+gives no reset time), a rejected slot for 24 hours. A slot the API
+answered comes off the skip list at once.
 
 The attempts share the agent's 14-minute budget — see
 [Timeouts](#timeouts). A later attempt runs only with at least 2 minutes
@@ -460,6 +533,7 @@ model:
 
 | Job | Permissions | Sees the diff | Can post a check run or mint an OIDC token |
 | --- | --- | --- | --- |
+| `slots` | `id-token: write` | no | mints a token, to read the skip list |
 | `review` | `contents: read` | yes | **no** |
 | `report` | `checks: write`, `id-token: write` | no | yes |
 
@@ -527,8 +601,9 @@ Greenlight dispatches the caller with `workflow_dispatch` **on the PR's
 base branch** — that split is what stops a PR editing its own reviewer,
 and it is not negotiable. GitHub Actions attaches a workflow run's check
 suite to the **dispatched ref's tip commit**. So every review run writes
-its two job check runs, `review / review` and `review / report`, onto the
-base branch's head commit in *your* repository. For an ordinary PR that
+its job check runs, `review / credential slots`, `review / review` and
+`review / report`, onto the base branch's head commit in *your*
+repository. For an ordinary PR that
 commit is the tip of your `main`.
 
 Nothing keeps them off it. The two check runs name jobs, not verdicts,
@@ -545,6 +620,9 @@ error: a `neutral` check run titled "Errored", carrying the reason, and
 `error` to greenlight, which records no decision and re-runs the review.
 A fault fixed outside the PR, such as a credential, takes effect on the
 next run.
+
+The `slots` job does not exit non-zero either. Every way the skip-list
+call can fail gives an empty skip list and a warning.
 
 | Failure | What the PR sees |
 | --- | --- |
@@ -698,6 +776,10 @@ whole minutes left of the budget, and run only with at least 2 of them
 left. A quota or auth error should return within seconds, but nothing
 here relies on that: however the time splits, the attempts together stay
 inside the 14 minutes.
+
+The `slots` job runs before the `review` job and is capped at **2**
+minutes; its two calls have 10 seconds each. With the `review` job's 16
+that is 18 minutes at worst, still under greenlight's 20.
 
 The caps that matter are the ones on the **steps**. A step that overruns
 fails, `continue-on-error` keeps the job green, and the verdict step
