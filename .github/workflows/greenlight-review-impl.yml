@@ -917,8 +917,10 @@ jobs:
           # The reset time, when the text carries one: older Claude Code wrote
           # `...usage limit reached|<unix seconds>`, newer writes `resets <time>`.
           # The text form keeps only characters that are safe in a workflow
-          # command and in a summary.
-          epoch=$(grep -oE '\|[0-9]{10}([^0-9]|$)' <<<"${text}" | head -1 | tr -cd '0-9')
+          # command and in a summary. GitHub runs this step as `bash -e`, and with
+          # pipefail a pipeline whose grep finds nothing fails, so both pipelines
+          # end in `|| true`: a text without one form must not end the step.
+          epoch=$(grep -oE '\|[0-9]{10}([^0-9]|$)' <<<"${text}" | head -1 | tr -cd '0-9') || true
           if [ -n "${epoch}" ] && formatted=$(date -u -d "@${epoch}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null); then
             resets=${formatted}
             resets_epoch=${epoch}
@@ -926,7 +928,7 @@ jobs:
             when=$(grep -oiE 'resets? (at |in )?.*' <<<"${text}" | head -1 \
               | sed -E 's/^[Rr][Ee][Ss][Ee][Tt][Ss]? (at |in )?//' \
               | LC_ALL=C sed -E 's/[^A-Za-z0-9 :,()\/+_-].*//' \
-              | sed -E 's/[ ,]+$//' | cut -c1-60)
+              | sed -E 's/[ ,]+$//' | cut -c1-60) || true
             if [ -n "${when}" ]; then resets=${when}; fi
           fi
 
@@ -1087,8 +1089,10 @@ jobs:
           # The reset time, when the text carries one: older Claude Code wrote
           # `...usage limit reached|<unix seconds>`, newer writes `resets <time>`.
           # The text form keeps only characters that are safe in a workflow
-          # command and in a summary.
-          epoch=$(grep -oE '\|[0-9]{10}([^0-9]|$)' <<<"${text}" | head -1 | tr -cd '0-9')
+          # command and in a summary. GitHub runs this step as `bash -e`, and with
+          # pipefail a pipeline whose grep finds nothing fails, so both pipelines
+          # end in `|| true`: a text without one form must not end the step.
+          epoch=$(grep -oE '\|[0-9]{10}([^0-9]|$)' <<<"${text}" | head -1 | tr -cd '0-9') || true
           if [ -n "${epoch}" ] && formatted=$(date -u -d "@${epoch}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null); then
             resets=${formatted}
             resets_epoch=${epoch}
@@ -1096,7 +1100,7 @@ jobs:
             when=$(grep -oiE 'resets? (at |in )?.*' <<<"${text}" | head -1 \
               | sed -E 's/^[Rr][Ee][Ss][Ee][Tt][Ss]? (at |in )?//' \
               | LC_ALL=C sed -E 's/[^A-Za-z0-9 :,()\/+_-].*//' \
-              | sed -E 's/[ ,]+$//' | cut -c1-60)
+              | sed -E 's/[ ,]+$//' | cut -c1-60) || true
             if [ -n "${when}" ]; then resets=${when}; fi
           fi
 
@@ -1256,8 +1260,10 @@ jobs:
           # The reset time, when the text carries one: older Claude Code wrote
           # `...usage limit reached|<unix seconds>`, newer writes `resets <time>`.
           # The text form keeps only characters that are safe in a workflow
-          # command and in a summary.
-          epoch=$(grep -oE '\|[0-9]{10}([^0-9]|$)' <<<"${text}" | head -1 | tr -cd '0-9')
+          # command and in a summary. GitHub runs this step as `bash -e`, and with
+          # pipefail a pipeline whose grep finds nothing fails, so both pipelines
+          # end in `|| true`: a text without one form must not end the step.
+          epoch=$(grep -oE '\|[0-9]{10}([^0-9]|$)' <<<"${text}" | head -1 | tr -cd '0-9') || true
           if [ -n "${epoch}" ] && formatted=$(date -u -d "@${epoch}" '+%Y-%m-%d %H:%M UTC' 2>/dev/null); then
             resets=${formatted}
             resets_epoch=${epoch}
@@ -1265,7 +1271,7 @@ jobs:
             when=$(grep -oiE 'resets? (at |in )?.*' <<<"${text}" | head -1 \
               | sed -E 's/^[Rr][Ee][Ss][Ee][Tt][Ss]? (at |in )?//' \
               | LC_ALL=C sed -E 's/[^A-Za-z0-9 :,()\/+_-].*//' \
-              | sed -E 's/[ ,]+$//' | cut -c1-60)
+              | sed -E 's/[ ,]+$//' | cut -c1-60) || true
             if [ -n "${when}" ]; then resets=${when}; fi
           fi
 

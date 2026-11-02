@@ -64,7 +64,9 @@
 #
 # (3), (4) and (6) to (12) all work the same way: the shell block is lifted out
 # of the shipped YAML by its `greenlight-*:begin`/`:end` markers and run
-# here, so these test the code CI runs rather than a copy of it.
+# here, so these test the code CI runs rather than a copy of it. Each
+# block runs under `bash -e`, as GitHub runs a `run:` step that names no
+# `shell:`; plain `bash` let a block pass here that ended early in prod.
 #
 # Run from anywhere: scripts/check-review-workflow.sh
 
@@ -172,7 +174,7 @@ fatal_gives_error() {
   : > "$out"
   if ! STRUCTURED_OUTPUT='' AGENT_OUTCOME=skipped AGENT_CONCLUSION='' \
       REVIEW_FATAL="$fatal" GITHUB_OUTPUT="$out" \
-      bash "$verdict_snippet" >/dev/null 2>&1; then
+      bash -e "$verdict_snippet" >/dev/null 2>&1; then
     fail "verdict block exited non-zero after ${label}"
     return
   fi
@@ -733,7 +735,7 @@ for case in "${credential_cases[@]}"; do
   done
 
   if out=$(env "${guard_env[@]}" GITHUB_ENV="$env_file" GITHUB_OUTPUT="$out_file" \
-      bash "$guard_snippet" 2>&1); then
+      bash -e "$guard_snippet" 2>&1); then
     status=0
   else
     status=1
@@ -903,7 +905,7 @@ for case in "${prompt_cases[@]}"; do
   if (cd "$work" && PROMPT_PATH="$PROMPT_REL" REVIEW_NAME=security PR_NUMBER=7 \
         BASE_REF=main HEAD_SHA=deadbeef REPO=dourolabs/prototypes \
         GITHUB_OUTPUT="$out_file" GITHUB_ENV="$env_file" \
-        bash "$prompt_snippet" >/dev/null 2>&1); then
+        bash -e "$prompt_snippet" >/dev/null 2>&1); then
     status=0
   else
     status=1
@@ -999,10 +1001,10 @@ for case in "${preflight_cases[@]}"; do
   run_preflight() {
     if [ -n "$preset" ]; then
       REVIEW_FATAL="$preset" CREDS_OUTCOME="$creds" PROMPT_OUTCOME="$prompt" \
-        ORDER_OUTCOME="$order" GITHUB_ENV="$env_file" bash "$preflight_snippet" 2>&1
+        ORDER_OUTCOME="$order" GITHUB_ENV="$env_file" bash -e "$preflight_snippet" 2>&1
     else
       CREDS_OUTCOME="$creds" PROMPT_OUTCOME="$prompt" ORDER_OUTCOME="$order" \
-        GITHUB_ENV="$env_file" bash "$preflight_snippet" 2>&1
+        GITHUB_ENV="$env_file" bash -e "$preflight_snippet" 2>&1
     fi
   }
 
@@ -1078,7 +1080,7 @@ run_order() {
   : > "$order_out"
   : > "$order_env"
   SLOTS="$slots" SKIP="$skip" GITHUB_OUTPUT="$order_out" GITHUB_ENV="$order_env" \
-    bash "$order_snippet" >/dev/null 2>&1
+    bash -e "$order_snippet" >/dev/null 2>&1
 }
 order_output() { sed -n "s/^$1=//p" "$order_out"; }
 
@@ -1280,7 +1282,7 @@ run_diff_step() {
   : > "$diff_work/output"
   : > "$diff_work/env"
   (cd "$diff_work" && BASE_REF="${1:-main}" GITHUB_OUTPUT="$diff_work/output" \
-     GITHUB_ENV="$diff_work/env" bash "$review_diff_snippet" >/dev/null 2>&1)
+     GITHUB_ENV="$diff_work/env" bash -e "$review_diff_snippet" >/dev/null 2>&1)
 }
 
 diff_output() { sed -n "s/^$1=//p" "$diff_work/output"; }
@@ -1398,7 +1400,7 @@ compose_prompt() {
      BASE_REF=main HEAD_SHA=deadbeef REPO=dourolabs/prototypes \
      DIFF_STATUS="$1" DIFF_BYTES=500000 DIFF_CAP_BYTES="$cap" \
      GITHUB_OUTPUT="$work/output" GITHUB_ENV="$work/env" \
-     bash "$prompt_snippet" >/dev/null 2>&1) || true
+     bash -e "$prompt_snippet" >/dev/null 2>&1) || true
   cat "$work/output"
 }
 
@@ -1501,7 +1503,7 @@ for case in "${cases[@]}"; do
   out=$(mktemp)
   if ! STRUCTURED_OUTPUT="$payload" AGENT_OUTCOME="$outcome" \
       AGENT_CONCLUSION="$conclusion" REVIEW_FATAL="$fatal" GITHUB_OUTPUT="$out" \
-      bash "$verdict_snippet" >/dev/null 2>&1; then
+      bash -e "$verdict_snippet" >/dev/null 2>&1; then
     fail "verdict block exited non-zero on ${label}"
     rm -f "$out"
     continue
@@ -1545,7 +1547,7 @@ out="$scratch/long-normalise"
 : > "$out"
 STRUCTURED_OUTPUT="{\"verdict\":\"reject\",\"summary\":\"${long_multibyte}\"}" AGENT_OUTCOME=success \
   AGENT_CONCLUSION=success REVIEW_FATAL='' GITHUB_OUTPUT="$out" \
-  bash "$verdict_snippet" >/dev/null 2>&1 || true
+  bash -e "$verdict_snippet" >/dev/null 2>&1 || true
 if [ "$(sed -n 's/^summary=//p' "$out")" = "$long_multibyte" ]; then
   ok "verdict block passes a ${#long_multibyte}-character summary on whole"
 else
@@ -1578,7 +1580,7 @@ for case in "${multi_cases[@]}"; do
 
   out="$scratch/multi-normalise"
   : > "$out"
-  if ! env -u REVIEW_FATAL "${env_args[@]}" GITHUB_OUTPUT="$out" bash "$verdict_snippet" >/dev/null 2>&1; then
+  if ! env -u REVIEW_FATAL "${env_args[@]}" GITHUB_OUTPUT="$out" bash -e "$verdict_snippet" >/dev/null 2>&1; then
     fail "verdict block exited non-zero on ${label}"
     continue
   fi
@@ -1643,7 +1645,7 @@ for case in "${agent_error_cases[@]}"; do
   IFS='|' read -r file expect_error want label <<<"$case"
   if [ "$file" = MISSING ]; then path="$exec_dir/missing.json"; else path="$exec_dir/$file"; fi
 
-  if out=$(EXECUTION_FILE="$path" SLOT_1=3 bash "$agent_error_snippet" 2>&1); then
+  if out=$(EXECUTION_FILE="$path" SLOT_1=3 bash -e "$agent_error_snippet" 2>&1); then
     ok "agent-error step exits 0 for ${label}"
   else
     fail "agent-error step exited non-zero for ${label}: ${out}"
@@ -1673,7 +1675,7 @@ done
 # run, prints nothing.
 out=$(EXECUTION_FILE="$exec_dir/crash.json" EXECUTION_FILE_2="$exec_dir/clean.json" \
   EXECUTION_FILE_3="$exec_dir/two.json" SLOT_1=4 SLOT_2=1 SLOT_3=2 \
-  bash "$agent_error_snippet" 2>&1) || fail "agent-error step exited non-zero for three attempts"
+  bash -e "$agent_error_snippet" 2>&1) || fail "agent-error step exited non-zero for three attempts"
 want_1="::error::The review agent reported an error (attempt 1, slot 4): ${crash_text}"
 want_3="::error::The review agent reported an error (attempt 3, slot 2): second"
 if [ "$(grep -c '^::error::' <<<"$out")" -eq 2 ] && grep -qxF "$want_1" <<<"$out" \
@@ -1682,7 +1684,7 @@ if [ "$(grep -c '^::error::' <<<"$out")" -eq 2 ] && grep -qxF "$want_1" <<<"$out
 else
   fail "agent-error step for three attempts printed: ${out}"
 fi
-if out=$(EXECUTION_FILE='' EXECUTION_FILE_2='' EXECUTION_FILE_3='' bash "$agent_error_snippet" 2>&1) \
+if out=$(EXECUTION_FILE='' EXECUTION_FILE_2='' EXECUTION_FILE_3='' bash -e "$agent_error_snippet" 2>&1) \
     && [ -z "$out" ]; then
   ok "agent-error step prints nothing when no attempt ran"
 else
@@ -1754,6 +1756,9 @@ result_file() {
 result_file epoch.json true 'Claude AI usage limit reached|1761955200'
 result_file resets.json true "You've hit your weekly limit · resets Nov 3, 5pm (America/New_York)"
 result_file session.json true "You've hit your session limit · resets 3pm"
+# The exact text of pyth-network/pyth-lazer run 41495814499, where the
+# classifier ended under GitHub's `bash -e` before it wrote any output.
+result_file prod-weekly.json true "You've hit your weekly limit · resets 2pm (UTC)"
 result_file credits.json true "You're out of extra usage · add funds to continue"
 result_file auth401.json true "$crash_text"
 result_file invalid-key.json true 'Invalid API key · Please run /login'
@@ -1778,6 +1783,7 @@ rotate_cases=(
   "epoch.json|3|1|10|true|quota|${epoch_text}|true|a usage limit with an epoch reset"
   "resets.json|1|4|10|true|quota|Nov 3, 5pm (America/New_York)|true|a weekly limit with a resets time"
   "session.json|2|5|10|true|quota|3pm|true|a session limit"
+  "prod-weekly.json|1|2|10|true|quota|2pm (UTC)|true|the weekly limit text from run 41495814499"
   "credits.json|2|5|10|true|quota|unknown|true|out of extra usage"
   "auth401.json|4|2|10|true|auth|unknown|true|a 401"
   "invalid-key.json|4|2|10|true|auth|unknown|true|an invalid API key"
@@ -1813,7 +1819,7 @@ for case in "${rotate_cases[@]}"; do
   [ "$minutes" = 0 ] && deadline=$(( $(date +%s) - 60 ))
 
   if out=$(ATTEMPT=1 EXECUTION_FILE="$path" SLOT="$slot" NEXT_SLOT="$next_slot" \
-      DEADLINE="$deadline" GITHUB_OUTPUT="$rotate_out" bash "$rotate_snippet" 2>&1); then
+      DEADLINE="$deadline" GITHUB_OUTPUT="$rotate_out" bash -e "$rotate_snippet" 2>&1); then
     ok "classifier exits 0 for ${label}"
   else
     fail "classifier exited non-zero for ${label}: ${out}"
@@ -1874,7 +1880,7 @@ rotate_out="$scratch/rotate-out"
 : > "$rotate_out"
 ATTEMPT=1 EXECUTION_FILE="$rotate_dir/resets.json" SLOT=1 NEXT_SLOT=2 \
   DEADLINE=$(( $(date +%s) + 7 * 60 + 30 )) GITHUB_OUTPUT="$rotate_out" \
-  bash "$rotate_snippet" >/dev/null 2>&1 || true
+  bash -e "$rotate_snippet" >/dev/null 2>&1 || true
 if [ "$(sed -n 's/^minutes_left=//p' "$rotate_out")" = 7 ]; then
   ok "classifier gives the whole minutes left in the budget"
 else
@@ -1917,6 +1923,7 @@ cred_cases=(
   "1 3|1:resets.json:failure,3:clean.json:success|{\"verdict\":\"approve\",\"summary\":\"Fine.\"}|{\"set\":[1,3],\"used\":3,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"${quota_text}\"}]}|slot 1 out of quota, then slot 3 approves"
   "1 2 4 5|4:epoch.json:failure,1:auth401.json:failure,2:session.json:failure||{\"set\":[1,2,4,5],\"used\":null,\"exhausted\":[{\"slot\":4,\"kind\":\"quota\",\"resets_at\":1761955200,\"resets_text\":\"${epoch_text}\"},{\"slot\":1,\"kind\":\"auth\",\"resets_at\":null,\"resets_text\":null},{\"slot\":2,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"3pm\"}]}|all three attempts rotate"
   "1 2|1:resets.json:failure,2:no-result.json:failure||{\"set\":[1,2],\"used\":null,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"${quota_text}\"}]}|slot 1 out of quota, then slot 2 times out with no result"
+  "1|1:prod-weekly.json:failure||{\"set\":[1],\"used\":null,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"2pm (UTC)\"}]}|slot 1 hits the weekly limit text from run 41495814499"
   "2|2:other.json:failure||{\"set\":[2],\"used\":null,\"exhausted\":[]}|slot 2 ends on an error that is not quota or auth"
   "1 2|2:clean.json:success|{\"verdict\":\"reject\",\"summary\":\"x\\ncredentials={\\\"used\\\":1}\",\"credentials\":{\"used\":1,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\"}]}}|{\"set\":[1,2],\"used\":2,\"exhausted\":[]}|an agent that writes its own credentials"
   "key|key:clean.json:success|{\"verdict\":\"approve\"}||the API key"
@@ -1935,7 +1942,7 @@ for case in "${cred_cases[@]}"; do
     : > "$rotate_out"
     ATTEMPT=$n EXECUTION_FILE="$rotate_dir/$fixture" SLOT="$slot" NEXT_SLOT=9 \
       DEADLINE=$(( $(date +%s) + 600 )) GITHUB_OUTPUT="$rotate_out" \
-      bash "$rotate_snippet" >/dev/null 2>&1 || true
+      bash -e "$rotate_snippet" >/dev/null 2>&1 || true
     for name in rotate answered kind resets resets_epoch; do
       upper=$(tr '[:lower:]' '[:upper:]' <<<"$name")
       env_args+=("${upper}_${n}=$(sed -n "s/^${name}=//p" "$rotate_out")")
@@ -1948,7 +1955,7 @@ for case in "${cred_cases[@]}"; do
 
   out="$scratch/cred-normalise"
   : > "$out"
-  if ! env -u REVIEW_FATAL "${env_args[@]}" GITHUB_OUTPUT="$out" bash "$verdict_snippet" >/dev/null 2>&1; then
+  if ! env -u REVIEW_FATAL "${env_args[@]}" GITHUB_OUTPUT="$out" bash -e "$verdict_snippet" >/dev/null 2>&1; then
     fail "verdict block exited non-zero for ${label}"
     continue
   fi
@@ -1993,7 +2000,7 @@ else
 fi
 
 if out=$(cd "$git_work" && ORIGIN_URL=https://github.com/o/r.git \
-    GIT_CEILING_DIRECTORIES="$scratch" bash "$git_root_snippet" 2>&1); then
+    GIT_CEILING_DIRECTORIES="$scratch" bash -e "$git_root_snippet" 2>&1); then
   ok "git-root step exits 0"
 else
   fail "git-root step exited non-zero: ${out}"
@@ -2007,7 +2014,7 @@ fi
 
 # Run twice, as a re-run on a reused workspace would: still exit 0.
 if (cd "$git_work" && ORIGIN_URL=https://github.com/o/r.git \
-    GIT_CEILING_DIRECTORIES="$scratch" bash "$git_root_snippet") >/dev/null 2>&1; then
+    GIT_CEILING_DIRECTORIES="$scratch" bash -e "$git_root_snippet") >/dev/null 2>&1; then
   ok "git-root step exits 0 when the root is already a repository"
 else
   fail "git-root step exited non-zero when the root is already a repository"
@@ -2045,7 +2052,7 @@ for case in "${resolve_cases[@]}"; do
   rm -rf "$work"
   mkdir -p "$work"
   if ! (cd "$work" && VERDICT="$in_verdict" SUMMARY="$in_summary" REVIEW_RESULT=failure \
-      bash "$resolve_snippet" >/dev/null 2>&1); then
+      bash -e "$resolve_snippet" >/dev/null 2>&1); then
     fail "resolve step exited non-zero for ${label}"
     continue
   fi
@@ -2071,7 +2078,7 @@ for case in "${resolve_cases[@]}"; do
 
   : > "$work/step-summary"
   out=$(cd "$work" && REVIEW_NAME=security GITHUB_STEP_SUMMARY="$work/step-summary" \
-    bash "$annotate_snippet" 2>&1) || fail "annotation step exited non-zero for ${label}"
+    bash -e "$annotate_snippet" 2>&1) || fail "annotation step exited non-zero for ${label}"
   want_line="::${level} title=Greenlight security%3A ${word}::${want_summary}"
   if [ "$out" = "$want_line" ]; then
     ok "annotation step prints '::${level} title=Greenlight security%3A ${word}' for ${label}"
@@ -2102,7 +2109,7 @@ for case in "${resolve_cred_cases[@]}"; do
   rm -rf "$work"
   mkdir -p "$work"
   if ! (cd "$work" && VERDICT=approve SUMMARY=Fine. CREDENTIALS="$creds" REVIEW_RESULT=success \
-      bash "$resolve_snippet" >/dev/null 2>&1); then
+      bash -e "$resolve_snippet" >/dev/null 2>&1); then
     fail "resolve step exited non-zero for ${label}"
     continue
   fi
@@ -2126,7 +2133,7 @@ nasty_summary=$'50% sure\r\nnext line\n::error::injected, really: yes'
 jq -n --arg s "$nasty_summary" \
   '{verdict: "reject", conclusion: "neutral", title: "Rejected", summary: $s}' > "$work/result.json"
 : > "$work/step-summary"
-out=$(cd "$work" && REVIEW_NAME='a:b,c%d' GITHUB_STEP_SUMMARY="$work/step-summary" bash "$annotate_snippet" 2>&1)
+out=$(cd "$work" && REVIEW_NAME='a:b,c%d' GITHUB_STEP_SUMMARY="$work/step-summary" bash -e "$annotate_snippet" 2>&1)
 want='::warning title=Greenlight a%3Ab%2Cc%25d%3A rejected::50%25 sure%0D%0Anext line%0A::error::injected, really: yes'
 if [ "$out" = "$want" ]; then
   ok "annotation step escapes %, CR and LF in the message, and also : and , in the title"
@@ -2147,7 +2154,7 @@ for run in '' '`' '``' '```' '``````'; do
   jq -n --arg s "$summary" \
     '{verdict: "approve", conclusion: "success", title: "Approved", summary: $s}' > "$work/result.json"
   : > "$work/step-summary"
-  (cd "$work" && REVIEW_NAME=security GITHUB_STEP_SUMMARY="$work/step-summary" bash "$annotate_snippet" >/dev/null 2>&1) \
+  (cd "$work" && REVIEW_NAME=security GITHUB_STEP_SUMMARY="$work/step-summary" bash -e "$annotate_snippet" >/dev/null 2>&1) \
     || fail "annotation step exited non-zero for a summary with a ${#run}-backtick run"
   fence=$(sed -n '3p' "$work/step-summary")
   want_len=$(( ${#run} >= 3 ? ${#run} + 1 : 3 ))
@@ -2164,7 +2171,7 @@ done
 # No result.json means the resolve step itself failed. Say so, and do not
 # fail the job over it.
 rm -f "$work/result.json"
-if out=$(cd "$work" && REVIEW_NAME=security GITHUB_STEP_SUMMARY="$work/step-summary" bash "$annotate_snippet" 2>&1) \
+if out=$(cd "$work" && REVIEW_NAME=security GITHUB_STEP_SUMMARY="$work/step-summary" bash -e "$annotate_snippet" 2>&1) \
     && grep -q '^::warning::' <<<"$out"; then
   ok "annotation step warns and exits 0 when no verdict was resolved"
 else
@@ -2382,7 +2389,7 @@ for case in "${post_cases[@]}"; do
   out=$(cd "$work" && VERDICT_URL="$verdict_url" VERDICT_RETRY_DELAY=0 \
     ACTIONS_ID_TOKEN_REQUEST_URL="$stub/token?api-version=2.0" \
     ACTIONS_ID_TOKEN_REQUEST_TOKEN=stub-request-token \
-    bash "$post_snippet" 2>&1)
+    bash -e "$post_snippet" 2>&1)
   status=$?
   set -e
 
@@ -2471,7 +2478,7 @@ for case in "${cred_post_cases[@]}"; do
   out=$(cd "$work" && VERDICT_URL="$verdict_url" VERDICT_RETRY_DELAY=0 \
     ACTIONS_ID_TOKEN_REQUEST_URL="$stub/token?api-version=2.0" \
     ACTIONS_ID_TOKEN_REQUEST_TOKEN=stub-request-token \
-    bash "$post_snippet" 2>&1)
+    bash -e "$post_snippet" 2>&1)
   status=$?
   set -e
   sent=$(tail -1 "$stub_dir/requests" | jq -r .body)
@@ -2496,7 +2503,7 @@ done
 work="$scratch/post-work"
 : > "$stub_dir/requests"
 set +e
-out=$(cd "$work" && VERDICT_URL="$verdict_url" VERDICT_RETRY_DELAY=0 bash "$post_snippet" 2>&1)
+out=$(cd "$work" && VERDICT_URL="$verdict_url" VERDICT_RETRY_DELAY=0 bash -e "$post_snippet" 2>&1)
 status=$?
 set -e
 if [ "$status" -ne 0 ] && grep -qF "id-token: write" <<<"$out" && [ ! -s "$stub_dir/requests" ]; then
@@ -2508,7 +2515,7 @@ fi
 # An empty verdict_url sends nothing and passes. The step's `if:` skips
 # it in CI already; this is the block's own guard.
 : > "$stub_dir/requests"
-if out=$(cd "$work" && VERDICT_URL='' bash "$post_snippet" 2>&1) && [ ! -s "$stub_dir/requests" ]; then
+if out=$(cd "$work" && VERDICT_URL='' bash -e "$post_snippet" 2>&1) && [ ! -s "$stub_dir/requests" ]; then
   ok "verdict POST with an empty verdict_url sends nothing and exits 0"
 else
   fail "verdict POST with an empty verdict_url did something: ${out}"
@@ -2555,7 +2562,7 @@ for case in "${slots_cases[@]}"; do
   started=$(date +%s)
   set +e
   out=$(cd "$work" && env "${token_env[@]}" VERDICT_URL="$verdict_url" SLOTS_FETCH_MAX_TIME=1 \
-    GITHUB_OUTPUT="$work/output" bash "$slots_snippet" 2>&1)
+    GITHUB_OUTPUT="$work/output" bash -e "$slots_snippet" 2>&1)
   status=$?
   set -e
   if [ "$status" -ne 0 ]; then
@@ -2597,7 +2604,7 @@ done
 if grep -qxF 'skipping slots 1 4 (greenlight: slot 1 quota until 2026-11-03T17:00:00Z; slot 4 auth until 2026-11-04T09:00:00Z); the review tries them last' \
     <<<"$(cd "$work" && printf '200\n%s' "$two_entries" > "$stub_dir/slots_reply" \
       && ACTIONS_ID_TOKEN_REQUEST_URL="$stub/token?api-version=2.0" ACTIONS_ID_TOKEN_REQUEST_TOKEN=stub-request-token \
-      VERDICT_URL="$verdict_url" GITHUB_OUTPUT=/dev/null bash "$slots_snippet" 2>&1)"; then
+      VERDICT_URL="$verdict_url" GITHUB_OUTPUT=/dev/null bash -e "$slots_snippet" 2>&1)"; then
   ok "slots step logs the slots it skips and until when"
 else
   fail "slots step does not log 'skipping slots 1 4 (greenlight: …)'"
@@ -2607,7 +2614,7 @@ fi
 # `if:` skips it in CI already; this is the block's own guard.
 : > "$stub_dir/slot_requests"
 : > "$work/output"
-out=$(cd "$work" && VERDICT_URL='' GITHUB_OUTPUT="$work/output" bash "$slots_snippet" 2>&1) || true
+out=$(cd "$work" && VERDICT_URL='' GITHUB_OUTPUT="$work/output" bash -e "$slots_snippet" 2>&1) || true
 if [ "$(cat "$work/output")" = "skip=" ] && [ ! -s "$stub_dir/slot_requests" ] && ! grep -q '^::' <<<"$out"; then
   ok "slots step with an empty verdict_url asks nothing and gives an empty skip list"
 else
