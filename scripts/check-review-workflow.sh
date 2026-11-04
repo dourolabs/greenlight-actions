@@ -246,7 +246,7 @@ fi
 
 OAUTH_SLOTS=(CLAUDE_CODE_OAUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN_2 CLAUDE_CODE_OAUTH_TOKEN_3
   CLAUDE_CODE_OAUTH_TOKEN_4 CLAUDE_CODE_OAUTH_TOKEN_5)
-CREDENTIALS=(ANTHROPIC_API_KEY "${OAUTH_SLOTS[@]}")
+CREDENTIALS=(ANTHROPIC_API_KEY "${OAUTH_SLOTS[@]}" OPENROUTER_API_KEY)
 
 for name in "${CREDENTIALS[@]}"; do
   if grep -qxF "      ${name}: \${{ secrets.${name} }}" "$CALLER"; then
@@ -655,10 +655,10 @@ for i in 0 1 2; do
   attempt=${ATTEMPTS[$i]}
   slot="slot_${slot_letters[$i]}"
   block=$(step_block "$attempt")
-  if grep -qxF '          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}' <<<"$block"; then
-    ok "'${attempt}' is passed ANTHROPIC_API_KEY"
+  if grep -qxF '          anthropic_api_key: ${{ secrets.OPENROUTER_API_KEY || secrets.ANTHROPIC_API_KEY }}' <<<"$block"; then
+    ok "'${attempt}' is passed OPENROUTER_API_KEY or ANTHROPIC_API_KEY"
   else
-    fail "'${attempt}' must pass 'anthropic_api_key: \${{ secrets.ANTHROPIC_API_KEY }}'"
+    fail "'${attempt}' must pass 'anthropic_api_key: \${{ secrets.OPENROUTER_API_KEY || secrets.ANTHROPIC_API_KEY }}'"
   fi
   n=1
   for name in "${OAUTH_SLOTS[@]}"; do

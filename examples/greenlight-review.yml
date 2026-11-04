@@ -65,3 +65,5 @@ jobs:
       CLAUDE_CODE_OAUTH_TOKEN_3: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_3 }}
       CLAUDE_CODE_OAUTH_TOKEN_4: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_4 }}
       CLAUDE_CODE_OAUTH_TOKEN_5: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN_5 }}
+      # Spike: an OpenRouter key, set alone in place of the six above.
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
