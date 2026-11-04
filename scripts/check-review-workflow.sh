@@ -54,7 +54,7 @@
 #     composed. The prompt points at them and tells the agent not to run
 #     git, builds or tests, and the agent step allows no shell tool,
 #     loads no project or local settings (so no PR-authored CLAUDE.md),
-#     and has only the Read tool.
+#     and has only the Read, Glob and Grep tools.
 # 11. Credential rotation. The order step shuffles the set slots; the
 #     agent runs up to three times, each attempt only after the one before
 #     hit a quota or auth error; the classifier rotates on those errors
@@ -559,14 +559,23 @@ for attempt in "${ATTEMPTS[@]}"; do
   # No PR-authored CLAUDE.md. Without `--setting-sources user` the
   # action loads the project and local sources too, and Claude Code then
   # hands `head/CLAUDE.md` and every nested one to the model as
-  # instructions. `--tools Read` keeps the built-in tools to `Read`.
-  for flag in '--setting-sources user' '--tools Read'; do
+  # instructions. `--tools Read,Glob,Grep` keeps the built-in tools to
+  # those three read-only ones.
+  for flag in '--setting-sources user' '--tools Read,Glob,Grep'; do
     if printf '%s\n' "$code" | grep -qE "^            ${flag}\$"; then
       ok "'${attempt}' passes ${flag} in claude_args"
     else
       fail "'${attempt}' must pass '${flag}' in claude_args; without it the agent loads PR-authored CLAUDE.md files as instructions"
     fi
   done
+
+  # Exactly that tool list: one `--tools` flag, so no second one adds to it.
+  tools_count=$(printf '%s\n' "$code" | grep -cE -- '--tools([ =]|$)' || true)
+  if [ "$tools_count" = 1 ]; then
+    ok "'${attempt}' passes exactly one --tools flag"
+  else
+    fail "'${attempt}' must pass exactly one --tools flag (found ${tools_count}); the tool list must be exactly Read,Glob,Grep"
+  fi
 done
 
 agent_block=$(step_block 'Run the review agent')
