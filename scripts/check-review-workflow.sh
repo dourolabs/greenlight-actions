@@ -52,7 +52,9 @@
 # 10. The PR diff. The agent has no shell, so a step writes the diff,
 #     the file list and the commits to `./review/` before the prompt is
 #     composed. The prompt points at them and tells the agent not to run
-#     git, builds or tests, and the agent step allows no shell tool.
+#     git, builds or tests, and the agent step allows no shell tool,
+#     loads no project or local settings (so no PR-authored CLAUDE.md),
+#     and has only the Read tool.
 # 11. Credential rotation. The order step shuffles the set slots; the
 #     agent runs up to three times, each attempt only after the one before
 #     hit a quota or auth error; the classifier rotates on those errors
@@ -553,6 +555,18 @@ for attempt in "${ATTEMPTS[@]}"; do
   else
     ok "'${attempt}' allows no Bash tool"
   fi
+
+  # No PR-authored CLAUDE.md. Without `--setting-sources user` the
+  # action loads the project and local sources too, and Claude Code then
+  # hands `head/CLAUDE.md` and every nested one to the model as
+  # instructions. `--tools Read` keeps the built-in tools to `Read`.
+  for flag in '--setting-sources user' '--tools Read'; do
+    if printf '%s\n' "$code" | grep -qE "^            ${flag}\$"; then
+      ok "'${attempt}' passes ${flag} in claude_args"
+    else
+      fail "'${attempt}' must pass '${flag}' in claude_args; without it the agent loads PR-authored CLAUDE.md files as instructions"
+    fi
+  done
 done
 
 agent_block=$(step_block 'Run the review agent')

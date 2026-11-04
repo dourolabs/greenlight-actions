@@ -775,6 +775,15 @@ jobs:
         # and allowed git could run a program through config the agent can
         # edit in `head/.git/config`. The diff step above writes what git
         # would have shown it.
+        #
+        # `--setting-sources user` and `--tools Read` in `claude_args`:
+        # without `--setting-sources` the action loads the user, project
+        # and local sources, and Claude Code then reads `head/CLAUDE.md` and
+        # every nested `CLAUDE.md` it reaches into the model's context as
+        # instructions. A PR could add one that tells the reviewer to
+        # approve. `user` loads nothing here, as the runner's HOME holds no
+        # Claude settings. `--tools Read` limits the built-in tools to
+        # `Read`. Both work with the OAuth slots, unlike `--bare`.
         with:
           # Unconditionally. `with:` keys cannot be omitted conditionally,
           # an unset secret renders empty, and the action treats empty as
@@ -800,6 +809,8 @@ jobs:
           classify_inline_comments: "false"
           claude_args: |
             --model claude-opus-5
+            --setting-sources user
+            --tools Read
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","reject"]},"summary":{"type":"string"}},"required":["verdict","summary"],"additionalProperties":false}'
 
       # Decides whether the attempt above failed on its credential: a
@@ -986,6 +997,8 @@ jobs:
           classify_inline_comments: "false"
           claude_args: |
             --model claude-opus-5
+            --setting-sources user
+            --tools Read
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","reject"]},"summary":{"type":"string"}},"required":["verdict","summary"],"additionalProperties":false}'
 
       # greenlight-rotate-2:begin
@@ -1157,6 +1170,8 @@ jobs:
           classify_inline_comments: "false"
           claude_args: |
             --model claude-opus-5
+            --setting-sources user
+            --tools Read
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["approve","reject"]},"summary":{"type":"string"}},"required":["verdict","summary"],"additionalProperties":false}'
 
       # greenlight-rotate-3:begin
