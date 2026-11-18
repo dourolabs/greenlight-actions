@@ -14,15 +14,20 @@ jobs:
     name: review workflow lint / checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: actionlint
         run: |
           set -euo pipefail
           version=1.7.7
-          curl -sSL --retry 3 \
-            "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz" \
-            | tar xz -C /usr/local/bin actionlint
+          # From actionlint_1.7.7_checksums.txt on the release. Change it
+          # with the version.
+          sha256=023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757
+          tarball="actionlint_${version}_linux_amd64.tar.gz"
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/$tarball" \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/${tarball}"
+          echo "${sha256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/$tarball" -C /usr/local/bin actionlint
           actionlint \
             .github/workflows/greenlight-review-impl.yml \
             examples/greenlight-review.yml
@@ -34,3 +39,8 @@ jobs:
       # a copy of it.
       - name: permission split, pass-through, conclusions, credentials, verdict
         run: scripts/check-review-workflow.sh
+
+      # Every `uses:` names a full commit SHA, so a moved upstream tag
+      # cannot change the code the review job runs.
+      - name: actions pinned by commit SHA
+        run: scripts/check-pinned-actions.sh
