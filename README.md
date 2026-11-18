@@ -119,9 +119,10 @@ dropped with a warning and the verdict is sent alone.
 ### The skip-list call
 
 The `slots` job runs first, when `verdict_url` is set. It requests an
-OIDC token whose audience is `verdict_url`, as the verdict POST does, and
-calls `GET <verdict_url origin>/api/review-credential-slots` with it,
-with a 10-second limit:
+OIDC token whose audience is `<verdict_url origin>/api/review-credential-slots`,
+and calls that URL with it, with a 10-second limit. Greenlight refuses a
+token with this audience on the verdict route, so a token the `slots`
+job holds cannot send a verdict:
 
 ```
 200 {"skip": [{"slot": 1, "kind": "quota", "skip_until": "2026-11-03T17:00:00Z"}]}
