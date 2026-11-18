@@ -482,14 +482,14 @@ else
 fi
 
 # Every step that can fail on its own: the two guards that run a script,
-# the two checkouts, the diff step, the order step, the preflight check,
+# the three checkouts, the diff step, the order step, the preflight check,
 # the git root, the three agent attempts, the three classifiers and the
 # step that prints the agent's error.
 continue_on_error=$(grep -c '^        continue-on-error: true$' <<<"$review_block" || true)
-if [ "$continue_on_error" -ge 15 ]; then
+if [ "$continue_on_error" -ge 16 ]; then
   ok "every fallible step in the review job carries continue-on-error (${continue_on_error})"
 else
-  fail "only ${continue_on_error} step(s) in the review job carry 'continue-on-error: true', expected at least 15: the credential guard, both checkouts, the diff step, the prompt step, the order step, the preflight check, the git root, the three agent attempts, the three classifiers and the agent's error. Without it a failing step fails the job, which reddens the base branch's tip commit"
+  fail "only ${continue_on_error} step(s) in the review job carry 'continue-on-error: true', expected at least 16: the credential guard, the three checkouts, the diff step, the prompt step, the order step, the preflight check, the git root, the three agent attempts, the three classifiers and the agent's error. Without it a failing step fails the job, which reddens the base branch's tip commit"
 fi
 
 # Full output prints every tool result, and those can hold secrets. The
@@ -874,9 +874,10 @@ fi
 
 ## 3c. The prompt step, extracted from the YAML and executed.
 
-# It owns three known failures — a base checkout that did not land, a
-# head checkout that did not land, and a prompt file that raced off the
-# base ref — and all three used to `exit 1`. Each must now record a
+# It owns four known failures — a prompt checkout (the dispatch ref)
+# that did not land, a base checkout that did not land, a head checkout
+# that did not land, and a prompt file that raced off the dispatch ref.
+# The first three used to `exit 1`. Each must now record a
 # REVIEW_FATAL naming the cause and exit 0, so the run ends as a
 # rejecting check run on the PR rather than a red X on the base branch.
 
@@ -890,34 +891,42 @@ fi
 PROMPT_REL='.github/greenlight/prompts/security.md'
 PROMPT_BODY='Review the diff for leaked credentials.'
 
-# base checkout | head checkout | prompt file present? | case label.
+# prompt checkout | base checkout | head checkout | prompt file where? | case label.
+# The prompt file field is `prompt` (in the dispatch-ref checkout, where
+# the step must read it), `base` (only in the base checkout, which the
+# step must NOT read, so a retargeted PR cannot pick its prompt) or blank.
 # The checkout fields are `yes` (populated), `empty` (the directory
 # exists but nothing landed in it, which is what a clone that died half
 # way leaves behind) or blank (no directory at all). The expected
 # diagnostic is derived from the label below: each failure has to name
 # the thing that went missing.
 prompt_cases=(
-  "|||base ref did not check out"
-  "empty|yes||base ref checked out empty"
-  "yes|||head sha did not check out"
-  "yes|empty||head sha checked out empty"
-  "yes|yes||prompt missing from the base ref"
-  "yes|yes|yes|everything present"
+  "||||dispatch ref did not check out"
+  "empty|yes|yes|base|dispatch ref checked out empty"
+  "yes|||prompt|base ref did not check out"
+  "yes|empty|yes|prompt|base ref checked out empty"
+  "yes|yes||prompt|head sha did not check out"
+  "yes|yes|empty|prompt|head sha checked out empty"
+  "yes|yes|yes||prompt missing from the dispatch ref"
+  "yes|yes|yes|base|prompt only on the base ref, missing from the dispatch ref"
+  "yes|yes|yes|prompt|everything present"
 )
 
 for case in "${prompt_cases[@]}"; do
-  IFS='|' read -r has_base has_head has_prompt label <<<"$case"
+  IFS='|' read -r has_promptref has_base has_head has_prompt label <<<"$case"
 
   work="$scratch/prompt-case"
   rm -rf "$work"
   mkdir -p "$work"
+  if [ -n "$has_promptref" ]; then mkdir -p "$work/prompt"; fi
+  if [ "$has_promptref" = yes ]; then printf 'default\n' > "$work/prompt/README"; fi
   if [ -n "$has_base" ]; then mkdir -p "$work/base"; fi
   if [ -n "$has_head" ]; then mkdir -p "$work/head"; fi
   if [ "$has_base" = yes ]; then printf 'base\n' > "$work/base/README"; fi
   if [ "$has_head" = yes ]; then printf 'head\n' > "$work/head/README"; fi
   if [ -n "$has_prompt" ]; then
-    mkdir -p "$work/base/$(dirname "$PROMPT_REL")"
-    printf '%s\n' "$PROMPT_BODY" > "$work/base/${PROMPT_REL}"
+    mkdir -p "$work/${has_prompt}/$(dirname "$PROMPT_REL")"
+    printf '%s\n' "$PROMPT_BODY" > "$work/${has_prompt}/${PROMPT_REL}"
   fi
 
   out_file="$work/output"
@@ -926,7 +935,7 @@ for case in "${prompt_cases[@]}"; do
   : > "$env_file"
 
   if (cd "$work" && PROMPT_PATH="$PROMPT_REL" REVIEW_NAME=security PR_NUMBER=7 \
-        BASE_REF=main HEAD_SHA=deadbeef REPO=dourolabs/prototypes \
+        BASE_REF=main HEAD_SHA=deadbeef DISPATCH_SHA=c0ffee REPO=dourolabs/prototypes \
         GITHUB_OUTPUT="$out_file" GITHUB_ENV="$env_file" \
         bash -e "$prompt_snippet" >/dev/null 2>&1); then
     status=0
@@ -942,7 +951,8 @@ for case in "${prompt_cases[@]}"; do
 
   fatal_lines=$(grep -c '^REVIEW_FATAL=' "$env_file" || true)
 
-  if [ "$has_base" = yes ] && [ "$has_head" = yes ] && [ -n "$has_prompt" ]; then
+  if [ "$has_promptref" = yes ] && [ "$has_base" = yes ] && [ "$has_head" = yes ] \
+     && [ "$has_prompt" = prompt ]; then
     if [ "$fatal_lines" -eq 0 ]; then
       ok "prompt step records no REVIEW_FATAL for ${label}"
     else
@@ -954,6 +964,12 @@ for case in "${prompt_cases[@]}"; do
       ok "prompt step composes the prompt for ${label}"
     else
       fail "prompt step did not write a delimited 'text' output for ${label}"
+    fi
+    # The agent must not see the dispatch-ref checkout.
+    if [ -e "$work/prompt" ]; then
+      fail "prompt step left ./prompt behind for ${label}"
+    else
+      ok "prompt step removes ./prompt after reading it for ${label}"
     fi
   else
     if [ "$fatal_lines" -eq 1 ]; then
@@ -971,7 +987,8 @@ for case in "${prompt_cases[@]}"; do
     fatal=$(sed -n 's/^REVIEW_FATAL=//p' "$env_file")
     fatal_gives_error "$fatal" "the prompt step's ${label}"
     case "$label" in
-      *"base ref"*)   want='main' ;;
+      *"dispatch ref did not"*|*"dispatch ref checked"*) want='c0ffee' ;;
+      *"base ref did not"*|*"base ref checked"*) want='main' ;;
       *"head sha"*)   want='deadbeef' ;;
       *)              want="$PROMPT_REL" ;;
     esac
@@ -982,6 +999,21 @@ for case in "${prompt_cases[@]}"; do
     fi
   fi
 done
+
+# The prompt checkout has to be the dispatch ref. A checkout of
+# `inputs.base_ref` would let a writer retarget the PR to a branch with
+# a weaker prompt.
+promptref_block=$(awk '
+  /- name: Check out the prompt from the dispatch ref$/ { on = 1; print; next }
+  on && /^      - name:/ { exit }
+  on { print }
+' "$IMPL")
+if grep -qF 'ref: ${{ github.sha }}' <<<"$promptref_block" \
+   && grep -qE '^ +path: prompt$' <<<"$promptref_block"; then
+  ok "the prompt checkout is github.sha in ./prompt"
+else
+  fail "the 'Check out the prompt from the dispatch ref' step must check out 'ref: \${{ github.sha }}' into 'path: prompt'"
+fi
 
 ## 3d. The preflight check, extracted from the YAML and executed.
 
@@ -1414,13 +1446,14 @@ fi
 compose_prompt() {
   local work="$scratch/prompt-diff"
   rm -rf "$work"
-  mkdir -p "$work/head" "$work/base/$(dirname "$PROMPT_REL")"
+  mkdir -p "$work/head" "$work/base" "$work/prompt/$(dirname "$PROMPT_REL")"
   printf 'head\n' > "$work/head/README"
-  printf '%s\n' "$PROMPT_BODY" > "$work/base/${PROMPT_REL}"
+  printf 'base\n' > "$work/base/README"
+  printf '%s\n' "$PROMPT_BODY" > "$work/prompt/${PROMPT_REL}"
   : > "$work/output"
   : > "$work/env"
   (cd "$work" && PROMPT_PATH="$PROMPT_REL" REVIEW_NAME=security PR_NUMBER=7 \
-     BASE_REF=main HEAD_SHA=deadbeef REPO=dourolabs/prototypes \
+     BASE_REF=main HEAD_SHA=deadbeef DISPATCH_SHA=c0ffee REPO=dourolabs/prototypes \
      DIFF_STATUS="$1" DIFF_BYTES=500000 DIFF_CAP_BYTES="$cap" \
      GITHUB_OUTPUT="$work/output" GITHUB_ENV="$work/env" \
      bash -e "$prompt_snippet" >/dev/null 2>&1) || true

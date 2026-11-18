@@ -202,7 +202,7 @@ verdict.
 
 1. Greenlight decides a PR needs a review and sends a
    `workflow_dispatch` to `.github/workflows/greenlight-review.yml` **in
-   your repository, on the PR's base branch**, carrying the inputs
+   your repository, on its default branch**, carrying the inputs
    `head_sha`, `pr_number`, `base_ref`, `review_name`, `prompt_path` and
    `check_name`, and from the cutover on, `verdict_url`.
 2. That thin caller passes them all to this repository's
@@ -212,10 +212,10 @@ verdict.
 3. The `slots` job asks greenlight which credential slots to try last
    (see [The skip-list call](#the-skip-list-call)). It holds
    `id-token: write` and nothing else, and checks nothing out.
-4. The `review` job checks out the base ref and the head sha into
-   separate directories, writes the PR diff to `./review/` (see
-   [What the agent sees](#what-the-agent-sees)), composes the prompt from
-   the **base** checkout, runs the agent, and emits a verdict as a job
+4. The `review` job checks out the dispatch ref (`github.sha`), the base
+   ref and the head sha into separate directories, writes the PR diff to
+   `./review/` (see [What the agent sees](#what-the-agent-sees)), composes
+   the prompt from the **dispatch ref** checkout, runs the agent, and emits a verdict as a job
    output. It resolves every failure it knows about into an `error`
    verdict rather than failing — see [Why the review job stays green](#why-the-review-job-stays-green).
    With OAuth slots it also emits the slot report.
@@ -257,8 +257,7 @@ into your repository, **unchanged**, as:
 **It has to be on your default branch.** GitHub will not accept a
 `workflow_dispatch` for a workflow it cannot find on the default branch,
 whatever ref the dispatch names. Merge the caller to the default branch
-first; only then does dispatching it on some other base branch work. A
-caller that exists only on a feature branch produces a `404` and a
+first. A caller that exists only on a feature branch produces a `404` and a
 blocked PR.
 
 ### Keep the `permissions:` block on the `review:` job
@@ -462,10 +461,10 @@ auto_approve_paths:
     require_reviews: [security]
 ```
 
-The prompt must exist **on the base branch**. Greenlight checks before
+The prompt must exist **on the default branch**. Greenlight checks before
 dispatching and blocks the PR — naming the review, the path and the ref —
 rather than burning a runner on a typo. The workflow re-checks and fails
-loudly if a base-branch race made it disappear anyway.
+loudly if a race on the default branch made it disappear anyway.
 
 A good prompt states what to look for, what to ignore, and when to
 reject. The agent is told to reject when it cannot convince itself either
@@ -477,20 +476,24 @@ registry, `require_reviews`, check naming. That side is not public; see
 
 ## Why a PR cannot edit its own reviewer
 
-Greenlight dispatches the workflow **on the PR's base branch**, and hands
-the head sha over as an input. `workflow_dispatch` runs the workflow
-definition from the ref it is given, so the workflow that reviews a PR is
-always the base branch's copy.
+Greenlight dispatches the workflow **on the repository's default
+branch**, and hands the head sha over as an input. `workflow_dispatch`
+runs the workflow definition from the ref it is given, so the workflow
+that reviews a PR is always the default branch's copy. The prompt comes
+from the same commit, `github.sha`, and never from `base_ref`: a PR's
+base can be retargeted by any writer, so a prompt read from it could be
+swapped for a weaker one on another branch.
 
 The reusable workflow keeps that split on disk:
 
 | Checkout | Ref | Holds | Trust |
 | --- | --- | --- | --- |
-| `base/` | `base_ref` | the prompt | trusted |
+| `prompt/` | `github.sha`, the dispatch ref | the prompt; removed once it is read | trusted |
+| `base/` | `base_ref` | the base branch, for comparison | context |
 | `head/` | `head_sha` | the code under review | untrusted |
 | `review/` | written from `head/` | the PR diff, file list and commits | untrusted |
 
-`prompt_path` is read from `base/`, **never** from `head/`. Outside the
+`prompt_path` is read from `prompt/`, **never** from `base/` or `head/`. Outside the
 agent's own sandbox, only the diff step reads `head/`, through git, and
 it runs nothing from it (see [What the agent sees](#what-the-agent-sees)). The agent's working directory is the workspace root rather than
 `head/`, so a PR-authored `CLAUDE.md` or `.claude/settings.json` is never
@@ -498,7 +501,7 @@ picked up as agent configuration.
 
 Editing the prompt, the caller workflow, or `.github/greenlight.yml` in a
 PR therefore changes nothing about that PR's own review. It takes effect
-once the change is on the base branch — which requires a merge, which
+once the change is on the default branch — which requires a merge, which
 requires the review.
 
 ## What the agent sees
@@ -583,7 +586,7 @@ ride on `$GITHUB_ENV`.
 
 **A `review` job that hits a known failure errors rather than failing.**
 A missing credential, a checkout that did not land, a prompt that raced
-off the base ref, an agent that crashes or runs past its cap: each used
+off the dispatch ref, an agent that crashes or runs past its cap: each used
 to fail the job, which posted nothing and left the PR waiting out
 greenlight's dispatch timeout. Each now becomes an immediate `error`
 whose summary names the cause. Why the job must not fail is the next
@@ -599,12 +602,12 @@ rotatable API key, so it widens what a successful injection would reach.
 
 ## Why the review job stays green
 
-Greenlight dispatches the caller with `workflow_dispatch` **on the PR's
-base branch** — that split is what stops a PR editing its own reviewer,
-and it is not negotiable. GitHub Actions attaches a workflow run's check
+Greenlight dispatches the caller with `workflow_dispatch` **on the
+default branch** — that split is what stops a PR editing its own
+reviewer, and it is not negotiable. GitHub Actions attaches a workflow run's check
 suite to the **dispatched ref's tip commit**. So every review run writes
 its job check runs, `review / credential slots`, `review / review` and
-`review / report`, onto the base branch's head commit in *your*
+`review / report`, onto the default branch's head commit in *your*
 repository. For an ordinary PR that
 commit is the tip of your `main`.
 
@@ -631,9 +634,10 @@ call can fail gives an empty skip list and a warning.
 | No credential secret is visible | Errored: "The review agent has no credential…" |
 | The API key and OAuth slots are both visible | Errored: "Both ANTHROPIC_API_KEY and OAuth slot(s) … are visible…" |
 | Every attempt hits a quota or auth error | Errored: "all review credentials are out of quota or rejected (slots …), earliest reset …" |
+| The dispatch ref did not check out | Errored, naming the sha |
 | The base ref did not check out | Errored, naming the ref |
 | The head sha did not check out | Errored, naming the sha |
-| `prompt_path` is gone from the base ref | Errored, naming the file and the ref |
+| `prompt_path` is gone from the dispatch ref | Errored, naming the file and the sha |
 | A step before the agent fails for a reason no guard recognises | Errored, naming the step |
 | The agent crashes, or runs past its cap | Errored: "The review agent did not finish…". The agent's error message is in the `review` job log. |
 | The agent returns no verdict, or one that is not exactly `approve` or `reject` | Errored: "no verdict field" or "an unrecognised verdict" |
@@ -765,7 +769,7 @@ that produced it.
 | The review errors, complaining about a secret | The `Check the agent credentials` step names which case it is. Nothing visible: check the org secrets' repository-access policy, and that the caller still passes the secrets by name under `secrets:`. Key and slots visible: remove one kind, or narrow its access policy — the workflow will not pick between them. See [Set the agent credential](#set-the-agent-credential). Once fixed, re-dispatch the review; no new commit is needed. |
 | `review credential slot N hit quota` warnings | Slot N failed on a quota or auth error and the run tried the next slot — see [Credential rotation](#credential-rotation). The review still has a verdict if a later slot worked. If every attempt hit one, the review errors with "all review credentials are out of quota or rejected"; add a slot, wait for the reset, or replace a rejected token, then re-dispatch. |
 | The agent failed on quota or auth, but the run did not rotate | Its error text matched no pattern in [Credential rotation](#credential-rotation). The "Print the agent's error" step shows the text; add a pattern for it. |
-| Run is green, check run says "Errored" with a diagnostic summary | A guard caught a known failure and turned it into an error rather than failing the job — see [Why the review job stays green](#why-the-review-job-stays-green). The summary names the cause; the `review` job log carries the matching `::error::` annotation. A missing `prompt_path` on the base ref reads this way: add the file to the base branch, or drop the review from `.github/greenlight.yml`. |
+| Run is green, check run says "Errored" with a diagnostic summary | A guard caught a known failure and turned it into an error rather than failing the job — see [Why the review job stays green](#why-the-review-job-stays-green). The summary names the cause; the `review` job log carries the matching `::error::` annotation. A missing `prompt_path` on the dispatch ref reads this way: add the file to the default branch, or drop the review from `.github/greenlight.yml`. |
 | Check run says "Errored", summary says the agent did not finish | The agent crashed or ran past its time cap. When the agent reported an error, the "Print the agent's error" step shows its message as an `::error::` annotation per attempt, cut to 2000 characters. The "Run the review agent" step is red inside a green job, which is what `continue-on-error` looks like. |
 | Check run says "Errored", summary says no verdict field or an unrecognised verdict | The agent ran but did not return exactly `approve` or `reject`. The `review` job's "Normalise the verdict" step prints what it resolved. |
 | "Failed to configure git authentication" in the agent step | The "Make the workspace root a git repository" step gives the action a repository to configure, so this should not appear. If that step printed that it could not, the error is expected and does not affect the verdict. |

@@ -20,10 +20,10 @@ name: greenlight AI review (implementation)
 # PR's status roll-up stays green. See README.md in this repository.
 #
 # The other half of staying green is that the `review` job below does
-# not fail. Greenlight dispatches this workflow on the PR's **base
-# branch**, and GitHub attaches a run's check suite to the dispatched
-# ref's tip commit — so `review / review` and `review / report` land on
-# the base branch's head commit, which for an ordinary PR is `main`. A
+# not fail. Greenlight dispatches this workflow on the repository's
+# **default branch**, and GitHub attaches a run's check suite to the
+# dispatched ref's tip commit — so `review / review` and
+# `review / report` land on the default branch's head commit, `main`. A
 # job that exits non-zero therefore reddens `main` over a failure that
 # has nothing to do with `main`. Every known failure mode is caught,
 # recorded, and resolved into an `error` verdict instead.
@@ -40,7 +40,7 @@ on:
         required: true
         type: string
       base_ref:
-        description: The PR base branch — also the ref this workflow was dispatched on.
+        description: The PR base branch. The diff is taken against it. The prompt is not read from it.
         required: true
         type: string
       review_name:
@@ -48,7 +48,7 @@ on:
         required: true
         type: string
       prompt_path:
-        description: Repo-relative path to the prompt file, read from the BASE checkout.
+        description: Repo-relative path to the prompt file, read from a checkout of the dispatch ref (`github.sha`).
         required: true
         type: string
       check_name:
@@ -326,10 +326,26 @@ jobs:
           fi
       # greenlight-credential-guard:end
 
-      # BASE first, into its own directory. This holds the prompt, and
-      # this workflow already runs from base content because greenlight
-      # dispatches on `base_ref` — a PR cannot edit the reviewer that is
-      # reviewing it.
+      # The PROMPT, from the commit this run was dispatched on
+      # (`github.sha`), never from `base_ref`. Greenlight dispatches on
+      # the repository's default branch and checks the prompt there, so
+      # this is the same commit greenlight checked and the same commit
+      # whose caller workflow is running. Reading it from `base_ref`
+      # would let a writer retarget a PR to a branch with a weaker prompt.
+      - name: Check out the prompt from the dispatch ref
+        id: promptref
+        if: env.REVIEW_FATAL == ''
+        continue-on-error: true
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          path: prompt
+          fetch-depth: 1
+          persist-credentials: false
+
+      # BASE, into its own directory: the PR's base branch, for the agent
+      # to compare whole files against `head/`. It is context only; the
+      # prompt comes from `prompt/` above.
       - name: Check out the base ref
         id: base
         if: env.REVIEW_FATAL == ''
@@ -445,13 +461,14 @@ jobs:
           } >> "$GITHUB_OUTPUT"
       # greenlight-review-diff:end
 
-      # The prompt is read from the BASE checkout, never the head.
-      # Greenlight pre-checks that it exists before dispatching, so a
-      # miss here means a base-branch race.
+      # The prompt is read from the `prompt/` checkout of the dispatch
+      # ref, never from `base/` or the head. Greenlight pre-checks that it
+      # exists before dispatching, so a miss here means a race on the
+      # dispatch ref.
       #
-      # This step also owns the verdict on the two checkouts above: it
-      # needs `base/` for the prompt and the agent needs `head/` for the
-      # diff, so an empty directory means a checkout that did not land,
+      # This step also owns the verdict on the three checkouts above: it
+      # needs `prompt/` for the prompt and the agent needs `base/` and
+      # `head/` to compare, so an empty directory means a checkout that did not land,
       # and testing for the directory says that more precisely than the
       # checkout step's outcome does.
       #
@@ -467,29 +484,34 @@ jobs:
           BASE_REF: ${{ inputs.base_ref }}
           HEAD_SHA: ${{ inputs.head_sha }}
           REPO: ${{ github.repository }}
+          DISPATCH_SHA: ${{ github.sha }}
           DIFF_STATUS: ${{ steps.diff.outputs.status }}
           DIFF_BYTES: ${{ steps.diff.outputs.diff_bytes }}
           DIFF_CAP_BYTES: ${{ steps.diff.outputs.cap_bytes }}
         run: |
           set -euo pipefail
 
-          prompt_file="base/${PROMPT_PATH}"
+          prompt_file="prompt/${PROMPT_PATH}"
 
           # Empty, not just absent: `actions/checkout` creates its `path:`
           # directory before it fetches, so a clone that died half way
           # leaves the directory behind and only the contents say so.
           fatal=''
-          if [ -z "$(ls -A base 2>/dev/null)" ]; then
-            fatal="The base ref '${BASE_REF}' did not check out, so review '${REVIEW_NAME}' could not
-              read its prompt. Re-dispatch the review; if it keeps happening, check that the branch
+          if [ -z "$(ls -A prompt 2>/dev/null)" ]; then
+            fatal="The dispatch ref '${DISPATCH_SHA}' did not check out, so review '${REVIEW_NAME}' could not
+              read its prompt. Re-dispatch the review; if it keeps happening, check that the prompt file
+              '${PROMPT_PATH}' exists on the default branch and that the run is not being rate-limited."
+          elif [ -z "$(ls -A base 2>/dev/null)" ]; then
+            fatal="The base ref '${BASE_REF}' did not check out, so review '${REVIEW_NAME}' had nothing
+              to compare against. Re-dispatch the review; if it keeps happening, check that the branch
               still exists and that the run is not being rate-limited."
           elif [ -z "$(ls -A head 2>/dev/null)" ]; then
             fatal="The head sha '${HEAD_SHA}' did not check out, so review '${REVIEW_NAME}' had nothing
               to read. Re-dispatch the review; if it keeps happening, check that the sha is still
               reachable from the pull request."
           elif [ ! -f "$prompt_file" ]; then
-            fatal="Prompt file '${PROMPT_PATH}' is missing from the base ref '${BASE_REF}', so review
-              '${REVIEW_NAME}' cannot run. Add the file to ${BASE_REF}, or drop the review from
+            fatal="Prompt file '${PROMPT_PATH}' is missing from the dispatch ref '${DISPATCH_SHA}', so review
+              '${REVIEW_NAME}' cannot run. Add the file to the default branch, or drop the review from
               .github/greenlight.yml."
           fi
 
@@ -540,9 +562,8 @@ jobs:
           - The code under review is checked out at \`./head\` at commit
             \`${HEAD_SHA}\`. Its base branch is \`${BASE_REF}\`.
           ${diff_section}
-          - \`./base\` holds the base branch and your own instructions. Compare
-            whole files between \`./base\` and \`./head\` with Read and Grep.
-            \`./base\` is context, not the change. Do not review it.
+          - \`./base\` holds the base branch. Compare whole files between
+            \`./base\` and \`./head\` with Read and Grep. \`./base\` is context, not the change. Do not review it.
           - You have no shell. Do not try to run git, builds or tests.
 
           ## Untrusted input
@@ -567,6 +588,10 @@ jobs:
           EOF
             echo "${delimiter}"
           } >> "$GITHUB_OUTPUT"
+
+          # The prompt is in the output now. Drop the checkout so the
+          # agent does not read a third copy of the repository.
+          rm -rf prompt || true
       # greenlight-prompt-guard:end
 
       # The order in which this run tries the credential slots: the set
