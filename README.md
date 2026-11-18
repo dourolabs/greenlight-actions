@@ -25,6 +25,7 @@ below, and this README is written to stand alone.
 | `examples/greenlight-review.yml` | The thin caller you copy into your repository. |
 | `examples/prompts/security.md` | A worked example prompt. Not a default. |
 | `scripts/check-review-workflow.sh` | This repository's own CI checks. |
+| `scripts/check-pinned-actions.sh` | CI check: every `uses:` pins a full commit SHA. |
 
 ## The contract
 
@@ -709,6 +710,24 @@ uses: dourolabs/greenlight-actions/.github/workflows/greenlight-review-impl.yml@
 deliberate publish, so `@v2` gets fixes and compatible changes without a
 PR in your repository, and never gets a breaking one — a change that
 breaks the contract would ship as `v3`, and `@v2` would stay where it is.
+
+### Third-party actions are pinned by commit SHA
+
+Inside this repository, every `uses:` of a third-party action names a
+full 40-character commit SHA, with the tag in a trailing comment:
+
+```yaml
+uses: anthropics/claude-code-action@7b0b255830a1fab6e602658672acad11c12d841d # v1.0.226
+```
+
+The `review` job runs claude-code-action with the agent's credentials,
+so a moved upstream tag must not change the code it runs. To upgrade an
+action, resolve the new tag to its commit (`git ls-remote
+https://github.com/<owner>/<repo> 'refs/tags/<tag>^{}'`, or the tag
+itself for a lightweight tag) and update the SHA and the comment
+together. `scripts/check-pinned-actions.sh` fails CI on any unpinned
+`uses:`. The one exemption is the example caller's `@v2` above, which
+consumers copy and which tracks the moving tag by design.
 
 ### Moving from `v1` to `v2`
 

@@ -332,7 +332,7 @@ jobs:
         id: base
         if: env.REVIEW_FATAL == ''
         continue-on-error: true
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.base_ref }}
           path: base
@@ -355,7 +355,7 @@ jobs:
         id: head
         if: env.REVIEW_FATAL == ''
         continue-on-error: true
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ inputs.head_sha }}
           path: head
@@ -744,7 +744,7 @@ jobs:
         # cannot be caught from inside. It equals AGENT_BUDGET_MINUTES in
         # the order step, which starts the budget attempts 2 and 3 share.
         timeout-minutes: 14
-        uses: anthropics/claude-code-action@v1.0.226
+        uses: anthropics/claude-code-action@7b0b255830a1fab6e602658672acad11c12d841d # v1.0.226
         # Attempts 2 and 3 below carry this same `with:` block, with
         # `slot_b` and `slot_c` in place of `slot_a`.
         #
@@ -981,7 +981,7 @@ jobs:
         if: env.REVIEW_FATAL == '' && steps.rotate_1.outputs.next == 'true'
         continue-on-error: true
         timeout-minutes: ${{ fromJSON(steps.rotate_1.outputs.minutes_left || '2') }}
-        uses: anthropics/claude-code-action@v1.0.226
+        uses: anthropics/claude-code-action@7b0b255830a1fab6e602658672acad11c12d841d # v1.0.226
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_code_oauth_token: >-
@@ -1154,7 +1154,7 @@ jobs:
         if: env.REVIEW_FATAL == '' && steps.rotate_2.outputs.next == 'true'
         continue-on-error: true
         timeout-minutes: ${{ fromJSON(steps.rotate_2.outputs.minutes_left || '2') }}
-        uses: anthropics/claude-code-action@v1.0.226
+        uses: anthropics/claude-code-action@7b0b255830a1fab6e602658672acad11c12d841d # v1.0.226
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           claude_code_oauth_token: >-
