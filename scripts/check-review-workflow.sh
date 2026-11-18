@@ -2547,9 +2547,14 @@ fi
 ## 6. The credential skip list, extracted from the YAML and executed.
 
 # The `slots` job asks the stub's skip-list route at the verdict URL's
-# origin, with an OIDC token for the verdict URL's audience, and writes
+# origin, with an OIDC token whose audience is that route's URL, and writes
 # `skip` as the slot numbers ordered by `skip_until`. Every failure gives
 # an empty `skip` and one warning, and the step always exits 0.
+
+# The stub mints a token only for the skip-list route's audience from
+# here on. A token for the verdict URL's audience gets no token, and
+# every case that expects slots fails.
+printf '%s' "$stub/api/review-credential-slots" > "$stub_dir/audience"
 
 extract_run_block "$IMPL" greenlight-credential-slots > "$slots_snippet"
 if [ ! -s "$slots_snippet" ]; then

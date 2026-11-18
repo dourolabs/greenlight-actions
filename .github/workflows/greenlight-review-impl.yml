@@ -143,10 +143,12 @@ jobs:
           fi
 
           # The route sits at the verdict URL's origin. The token's
-          # audience is the verdict URL itself, as for the verdict POST.
+          # audience is the route's own URL, so greenlight refuses this
+          # token on the verdict route.
           origin=$(grep -oE '^https?://[^/?#]+' <<<"${VERDICT_URL}") \
             || give_up "verdict_url has no http(s) origin"
-          audience=$(jq -rn --arg u "${VERDICT_URL}" '$u | @uri')
+          slots_url="${origin}/api/review-credential-slots"
+          audience=$(jq -rn --arg u "${slots_url}" '$u | @uri')
           token=$(curl -sS --fail --max-time "${max_time}" \
             -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" \
             "${ACTIONS_ID_TOKEN_REQUEST_URL:-}&audience=${audience}" 2>/dev/null \
@@ -158,7 +160,7 @@ jobs:
 
           status=$(curl -sS -o slots.json -w '%{http_code}' --max-time "${max_time}" \
             -H "Authorization: Bearer ${token}" \
-            "${origin}/api/review-credential-slots" 2>/dev/null) || true
+            "${slots_url}" 2>/dev/null) || true
           if [ "${status}" != 200 ]; then
             give_up "greenlight answered ${status:-nothing}"
           fi
