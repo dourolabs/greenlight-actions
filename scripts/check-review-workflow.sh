@@ -1817,6 +1817,10 @@ result_file session.json true "You've hit your session limit · resets 3pm"
 result_file prod-weekly.json true "You've hit your weekly limit · resets 2pm (UTC)"
 result_file credits.json true "You're out of extra usage · add funds to continue"
 result_file auth401.json true "$crash_text"
+# The exact text pyth-network/pyth-lazer reviews ended on from 2026-11-18,
+# after the organization turned off Claude subscription access.
+org_disabled_text='Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access'
+result_file org-disabled.json true "$org_disabled_text"
 result_file invalid-key.json true 'Invalid API key · Please run /login'
 result_file revoked.json true 'OAuth token revoked · Please run /login'
 result_file rate429.json true 'API Error: 429 {"type":"error","error":{"type":"rate_limit_error","message":"Number of request tokens has exceeded your per-minute rate limit"}}'
@@ -1844,6 +1848,7 @@ rotate_cases=(
   "auth401.json|4|2|10|true|auth|unknown|true|a 401"
   "invalid-key.json|4|2|10|true|auth|unknown|true|an invalid API key"
   "revoked.json|5|1|10|true|auth|unknown|true|a revoked OAuth token"
+  "org-disabled.json|1|2|10|true|auth|unknown|true|the organization-disabled subscription text from pyth-network/pyth-lazer"
   "rate429.json|1|2|10|true|quota|unknown|true|a 429 rate_limit_error"
   "rejected429.json|1|2|10|true|quota|unknown|true|a 429 the API rejected"
   "model.json|1|2|10|false||unknown|false|a model error"
@@ -1973,19 +1978,23 @@ fi
 
 # Set slots | attempts as slot:fixture:step outcome, comma-separated |
 # structured output of the last attempt | expected credentials JSON, or
-# empty for none | case label
+# empty for none | case label | expected summary, or empty to skip that
+# check
 quota_text='Nov 3, 5pm (America/New_York)'
 cred_cases=(
   "1 3|1:resets.json:failure,3:clean.json:success|{\"verdict\":\"approve\",\"summary\":\"Fine.\"}|{\"set\":[1,3],\"used\":3,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"${quota_text}\"}]}|slot 1 out of quota, then slot 3 approves"
   "1 2 4 5|4:epoch.json:failure,1:auth401.json:failure,2:session.json:failure||{\"set\":[1,2,4,5],\"used\":null,\"exhausted\":[{\"slot\":4,\"kind\":\"quota\",\"resets_at\":1761955200,\"resets_text\":\"${epoch_text}\"},{\"slot\":1,\"kind\":\"auth\",\"resets_at\":null,\"resets_text\":null},{\"slot\":2,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"3pm\"}]}|all three attempts rotate"
   "1 2|1:resets.json:failure,2:no-result.json:failure||{\"set\":[1,2],\"used\":null,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"${quota_text}\"}]}|slot 1 out of quota, then slot 2 times out with no result"
   "1|1:prod-weekly.json:failure||{\"set\":[1],\"used\":null,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"2pm (UTC)\"}]}|slot 1 hits the weekly limit text from run 41495814499"
+  "1|1:org-disabled.json:failure||{\"set\":[1],\"used\":null,\"exhausted\":[{\"slot\":1,\"kind\":\"auth\",\"resets_at\":null,\"resets_text\":null}]}|slot 1 refused with the organization-disabled text from pyth-network/pyth-lazer|The Claude credential was refused (slot 1: auth). Fix the token or set ANTHROPIC_API_KEY, then re-dispatch."
+  "1 2|1:resets.json:failure,2:org-disabled.json:failure||{\"set\":[1,2],\"used\":null,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\",\"resets_at\":null,\"resets_text\":\"${quota_text}\"},{\"slot\":2,\"kind\":\"auth\",\"resets_at\":null,\"resets_text\":null}]}|slot 1 out of quota, then slot 2 refused|The Claude credentials were refused (slots 1: quota, 2: auth). Fix the tokens or set ANTHROPIC_API_KEY, then re-dispatch."
+  "key|key:org-disabled.json:failure|||the API key refused|The review credential ANTHROPIC_API_KEY was refused (auth). Fix the key, then re-dispatch."
   "2|2:other.json:failure||{\"set\":[2],\"used\":null,\"exhausted\":[]}|slot 2 ends on an error that is not quota or auth"
   "1 2|2:clean.json:success|{\"verdict\":\"reject\",\"summary\":\"x\\ncredentials={\\\"used\\\":1}\",\"credentials\":{\"used\":1,\"exhausted\":[{\"slot\":1,\"kind\":\"quota\"}]}}|{\"set\":[1,2],\"used\":2,\"exhausted\":[]}|an agent that writes its own credentials"
   "key|key:clean.json:success|{\"verdict\":\"approve\"}||the API key"
 )
 for case in "${cred_cases[@]}"; do
-  IFS='|' read -r set_slots attempts structured want label <<<"$case"
+  IFS='|' read -r set_slots attempts structured want label want_summary <<<"$case"
   IFS=',' read -r -a steps <<<"$attempts"
   env_args=("SET_SLOTS=${set_slots}")
   n=0
@@ -2024,6 +2033,14 @@ for case in "${cred_cases[@]}"; do
     ok "slot report for ${label}: ${got}"
   else
     fail "slot report for ${label} is '${got}', expected '${want}'"
+  fi
+  if [ -n "$want_summary" ]; then
+    got_summary=$(sed -n 's/^summary=//p' "$out")
+    if [ "$got_summary" = "$want_summary" ]; then
+      ok "summary for ${label}: ${got_summary}"
+    else
+      fail "summary for ${label} is '${got_summary}', expected '${want_summary}'"
+    fi
   fi
 done
 
