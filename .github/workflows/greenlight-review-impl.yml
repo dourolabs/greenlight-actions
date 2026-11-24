@@ -896,6 +896,8 @@ jobs:
             "auth|authentication_error"
             "auth|api error: 401"
             "auth|401 unauthorized"
+            "auth|disabled claude subscription access"
+            "auth|use an anthropic api key instead"
           )
 
           rotate=false
@@ -1070,6 +1072,8 @@ jobs:
             "auth|authentication_error"
             "auth|api error: 401"
             "auth|401 unauthorized"
+            "auth|disabled claude subscription access"
+            "auth|use an anthropic api key instead"
           )
 
           rotate=false
@@ -1243,6 +1247,8 @@ jobs:
             "auth|authentication_error"
             "auth|api error: 401"
             "auth|401 unauthorized"
+            "auth|disabled claude subscription access"
+            "auth|use an anthropic api key instead"
           )
 
           rotate=false
@@ -1518,7 +1524,26 @@ jobs:
                 earliest=${!resets_var}
               fi
             done
-            if [ "${tried}" = key ]; then
+            # The last attempt's kind picks the wording. An auth refusal
+            # (a bad or expired token, or an organization that turned off
+            # subscription access) has no reset time: someone must fix the
+            # credential. The agent's own text stays out of the summary;
+            # the `Print the agent's error` step logs it.
+            last_kind_var="KIND_${last}"
+            if [ "${!last_kind_var:-}" = auth ]; then
+              refused=''
+              for n in $(seq 1 "$last"); do
+                slot_var="SLOT_${n}"; kind_var="KIND_${n}"
+                refused="${refused:+${refused}, }${!slot_var:-unknown}: ${!kind_var:-unknown}"
+              done
+            fi
+            if [ "${!last_kind_var:-}" = auth ] && [ "${tried}" = key ]; then
+              summary="The review credential ANTHROPIC_API_KEY was refused (auth). Fix the key, then re-dispatch."
+            elif [ "${!last_kind_var:-}" = auth ] && [ "${last}" = 1 ]; then
+              summary="The Claude credential was refused (slot ${refused}). Fix the token or set ANTHROPIC_API_KEY, then re-dispatch."
+            elif [ "${!last_kind_var:-}" = auth ]; then
+              summary="The Claude credentials were refused (slots ${refused}). Fix the tokens or set ANTHROPIC_API_KEY, then re-dispatch."
+            elif [ "${tried}" = key ]; then
               summary="The review credential ANTHROPIC_API_KEY is out of quota or rejected, reset ${earliest}."
             else
               summary="all review credentials are out of quota or rejected (slots ${tried}), earliest reset ${earliest}"
